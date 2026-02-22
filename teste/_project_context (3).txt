@@ -1,0 +1,2963 @@
+﻿<system_instruction>
+Você é um Arquiteto Fullstack Sênior. Analise o código abaixo para entender a arquitetura e lógica do projeto.
+Data da Extração: 2026-02-10 18:50:06
+</system_instruction>
+<project_structure>
+.\App.tsx
+.\capacitor.config.ts
+.\index.html
+.\index.tsx
+.\manifest.json
+.\metadata.json
+.\package.json
+.\tsconfig.json
+.\types.ts
+.\vite.config.ts
+.\components\AuthScreen.tsx
+.\components\ChatInterface.tsx
+.\components\ImageModal.tsx
+.\components\Library.tsx
+.\components\LoveAnimation.tsx
+.\components\ParticleBurst.tsx
+.\components\PatternLock.tsx
+.\components\Profile.tsx
+.\components\Sidebar.tsx
+.\services\avatarService.ts
+.\services\supabase.ts
+.\supabase\functions\push-notification\index.ts
+</project_structure>
+
+<file path=".\App.tsx">
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { Message, UserProfile } from './types';
+import ChatInterface from './components/ChatInterface';
+import Sidebar from './components/Sidebar';
+import Library from './components/Library';
+import AuthScreen from './components/AuthScreen';
+import Profile from './components/Profile';
+import { supabase, isSupabaseConfigured } from './services/supabase';
+import { getLatestAvatarUrl } from './services/avatarService';
+import { motion, AnimatePresence, Variants } from 'framer-motion';
+
+export type ViewState = 'chat' | 'library' | 'profile' | 'sidebar';
+
+export const AUTOR_ID = '00000000-0000-0000-0000-000000000001';
+export const MUSA_ID = '00000000-0000-0000-0000-000000000002';
+
+const AUTO_LOCK_TIMEOUT = 3 * 60 * 1000; 
+const PAGE_SIZE = 30;
+const HEARTBEAT_INTERVAL = 10000; // Reduzido de 30s para 10s
+
+// FIX: Adicionada a tipagem ': Variants' para corrigir o erro de build
+const pageVariants: Variants = {
+  initial: (direction: number) => ({
+    x: direction > 0 ? '100%' : '-100%',
+    opacity: 0,
+    scale: 0.95,
+  }),
+  animate: {
+    x: 0,
+    opacity: 1,
+    scale: 1,
+    transition: {
+      type: 'spring',
+      stiffness: 300,
+      damping: 30,
+    },
+  },
+  exit: (direction: number) => ({
+    x: direction < 0 ? '100%' : '-100%',
+    opacity: 0,
+    scale: 0.95,
+    transition: {
+      type: 'spring',
+      stiffness: 300,
+      damping: 30,
+    },
+  }),
+};
+
+const App: React.FC = () => {
+  const [currentUser, setCurrentUser] = useState<UserProfile | null>(null);
+  const [activeView, setActiveView] = useState<ViewState>('chat');
+  const [direction, setDirection] = useState(0); // Controle de direção da animação
+  const [isLocked, setIsLocked] = useState(true);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [partner, setPartner] = useState<UserProfile | null>(null);
+  const [isPartnerTyping, setIsPartnerTyping] = useState(false);
+  const [isShaking, setIsShaking] = useState(false);
+  const [hasMoreMessages, setHasMoreMessages] = useState(true);
+  const [hasNewerMessages, setHasNewerMessages] = useState(false);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const [isLoadingNext, setIsLoadingNext] = useState(false);
+  const [isViewingHistory, setIsViewingHistory] = useState(false);
+  const [newLiveMessagesCount, setNewLiveMessagesCount] = useState(0);
+  const [isOnline, setIsOnline] = useState(navigator.onLine);
+
+  const channelRef = useRef<any>(null);
+  const inactivityTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const partnerRef = useRef<UserProfile | null>(null);
+  useEffect(() => { partnerRef.current = partner; }, [partner]);
+
+  // Função helper para navegação com direção
+  const navigateTo = (view: ViewState) => {
+    // Define a direção baseada na hierarquia lógica: chat (centro) -> profile (direita) -> library (esquerda)
+    if (activeView === 'chat' && view === 'profile') setDirection(1);
+    else if (activeView === 'profile' && view === 'chat') setDirection(-1);
+    else if (activeView === 'chat' && view === 'library') setDirection(-1);
+    else if (activeView === 'library' && view === 'chat') setDirection(1);
+    else setDirection(1); // Default
+
+    setActiveView(view);
+  };
+
+  const updatePresence = useCallback(async (status: 'online' | 'offline') => {
+    if (!currentUser || !isSupabaseConfigured) return;
+    try {
+      await supabase
+        .from('profiles')
+        .update({
+          status: status,
+          last_seen: new Date().toISOString()
+        })
+        .eq('id', currentUser.id);
+      
+      // Se estiver ficando offline, remove também do Realtime Presence
+      if (status === 'offline' && channelRef.current) {
+        channelRef.current.untrack();
+      }
+    } catch (e) {
+      console.debug("Status de presença falhou.");
+    }
+  }, [currentUser]);
+
+  const lockApp = useCallback(() => {
+    if (isLocked) return;
+    setIsLocked(true);
+    updatePresence('offline');
+  }, [isLocked, updatePresence]);
+
+  const resetInactivityTimer = useCallback(() => {
+    if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
+    if (!isLocked) {
+      inactivityTimerRef.current = setTimeout(lockApp, AUTO_LOCK_TIMEOUT);
+    }
+  }, [isLocked, lockApp]);
+
+  useEffect(() => {
+    if (!currentUser || isLocked || activeView !== 'chat') {
+      if (currentUser) updatePresence('offline');
+      return;
+    }
+
+    updatePresence('online');
+    const interval = setInterval(() => {
+      updatePresence('online');
+    }, HEARTBEAT_INTERVAL);
+
+    return () => {
+      clearInterval(interval);
+      updatePresence('offline');
+    };
+  }, [currentUser, isLocked, activeView, updatePresence]);
+
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      const isSelectingFile = localStorage.getItem('capy_is_selecting_file') === 'true';
+
+      if (document.visibilityState === 'hidden') {
+        if (isSelectingFile) return;
+        updatePresence('offline');
+        lockApp();
+      } else if (document.visibilityState === 'visible') {
+        setTimeout(() => localStorage.removeItem('capy_is_selecting_file'), 2000);
+        if (!isLocked && activeView === 'chat') {
+          updatePresence('online');
+        }
+      }
+    };
+
+    const handleBeforeUnload = () => {
+      updatePresence('offline');
+    };
+
+    const handleUserActivity = () => resetInactivityTimer();
+    
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('pagehide', handleBeforeUnload); // Mais robusto para Mobile
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    window.addEventListener('touchstart', handleUserActivity);
+    window.addEventListener('click', handleUserActivity);
+    window.addEventListener('mousemove', handleUserActivity);
+    window.addEventListener('keydown', handleUserActivity);
+    window.addEventListener('focus', handleUserActivity);
+    window.addEventListener('online', () => setIsOnline(true));
+    window.addEventListener('offline', () => setIsOnline(false));
+
+    resetInactivityTimer();
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('pagehide', handleBeforeUnload);
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+      window.removeEventListener('touchstart', handleUserActivity);
+      window.removeEventListener('click', handleUserActivity);
+      window.removeEventListener('mousemove', handleUserActivity);
+      window.removeEventListener('keydown', handleUserActivity);
+      window.removeEventListener('focus', handleUserActivity);
+      if (inactivityTimerRef.current) clearTimeout(inactivityTimerRef.current);
+    };
+  }, [lockApp, resetInactivityTimer, updatePresence, isLocked, activeView]);
+
+  useEffect(() => {
+    if (isOnline && currentUser && isSupabaseConfigured) {
+      const syncPendingMessages = async () => {
+        const pending = messages.filter(m => m.is_pending);
+        if (pending.length === 0) return;
+
+        for (const msg of pending) {
+          try {
+            const { error } = await supabase.from('messages').insert([{
+              sender_id: currentUser.id,
+              text: msg.text,
+              type: msg.type,
+              reply_to_id: msg.reply_to_id
+            }]);
+
+            if (!error) {
+              setMessages(prev => prev.map(m => m.id === msg.id ? { ...m, is_pending: false } : m));
+            }
+          } catch (e) { }
+        }
+      };
+      syncPendingMessages();
+    }
+  }, [isOnline, currentUser, messages.length]);
+
+  const getDefaultPartner = (currentId: string): UserProfile => {
+    const savedPartner = localStorage.getItem('capy_partner');
+    if (savedPartner) {
+      const parsed = JSON.parse(savedPartner) as UserProfile;
+      if (parsed.id !== currentId) return parsed;
+    }
+    return {
+      id: currentId === AUTOR_ID ? MUSA_ID : AUTOR_ID,
+      name: 'Parceiro(a)',
+      avatar_url: '',
+      bio: '...',
+      status: 'offline'
+    };
+  };
+
+  const requestNotificationPermission = useCallback(() => {
+    if ('Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+  }, []);
+
+  const sendNotification = useCallback((msg: Message) => {
+    if ('Notification' in window && Notification.permission === 'granted') {
+      const partnerName = partnerRef.current?.name || 'Novo Amor';
+      const notification = new Notification(`Mensagem de ${partnerName}`, {
+        body: msg.type === 'text' ? msg.text : 'Enviou uma mídia 🌸',
+        icon: partnerRef.current?.avatar_url || '',
+        tag: 'capy-new-message',
+        renotify: true
+      } as any);
+      notification.onclick = () => {
+        window.focus();
+        setIsLocked(false);
+      };
+    }
+  }, []);
+
+  useEffect(() => {
+    const savedUser = localStorage.getItem('capy_active_user');
+    if (savedUser && isSupabaseConfigured) {
+      const user = JSON.parse(savedUser) as UserProfile;
+      setCurrentUser(user);
+      setPartner(getDefaultPartner(user.id));
+    }
+  }, []);
+
+  useEffect(() => {
+    if (currentUser?.id && !isLocked && isSupabaseConfigured) {
+      fetchMessages();
+    }
+  }, [currentUser?.id, isLocked]);
+
+  const fetchLatestProfiles = useCallback(async (userId?: string) => {
+    const activeId = userId || currentUser?.id;
+    if (!activeId || !isSupabaseConfigured) return;
+    try {
+      const { data } = await supabase.from('profiles').select('*').in('id', [AUTOR_ID, MUSA_ID]);
+      if (data) {
+        const me = data.find(p => p.id === activeId);
+        const them = data.find(p => p.id !== activeId);
+        
+        const [myLatestAvatar, theirLatestAvatar] = await Promise.all([
+          getLatestAvatarUrl(activeId),
+          them ? getLatestAvatarUrl(them.id) : null
+        ]);
+
+        if (me) {
+          setCurrentUser(prev => {
+            const current = prev || me;
+            const effectiveAvatar = myLatestAvatar || me.avatar_url || current.avatar_url;
+            const updated = { ...current, name: me.display_name, avatar_url: effectiveAvatar, bio: me.bio, pin: me.pin };
+            localStorage.setItem('capy_active_user', JSON.stringify(updated));
+            return updated;
+          });
+        }
+        if (them) {
+          setPartner(prev => {
+            const base = prev || getDefaultPartner(activeId);
+            const effectiveAvatar = theirLatestAvatar || them.avatar_url || base.avatar_url;
+            const updatedPartner = { 
+              ...base, 
+              name: them.display_name,
+              avatar_url: effectiveAvatar, 
+              bio: them.bio, 
+              status: them.status, 
+              last_seen: them.last_seen 
+            };
+            localStorage.setItem('capy_partner', JSON.stringify(updatedPartner));
+            return updatedPartner;
+          });
+        }
+      }
+    } catch (e) { 
+      console.error("Erro ao sincronizar perfis:", e);
+    }
+  }, [currentUser?.id]);
+
+  useEffect(() => {
+    if (currentUser?.id && !isLocked && isSupabaseConfigured) {
+      fetchLatestProfiles();
+    }
+  }, [currentUser?.id, isLocked, fetchLatestProfiles]);
+
+  const fetchMessages = useCallback(async (isLoadMore = false) => {
+    if (!isSupabaseConfigured || !currentUser || isLoadingMore) return;
+    try {
+      if (isLoadMore) setIsLoadingMore(true);
+      const query = supabase
+        .from('messages')
+        .select('*')
+        .order('created_at', { ascending: false });
+
+      if (isLoadMore && messages.length > 0) {
+        query.lt('created_at', messages[0].created_at);
+      }
+
+      const { data, error } = await query.limit(PAGE_SIZE);
+      if (error) throw error;
+
+      if (data) {
+        const sorted = data.reverse();
+        if (isLoadMore) {
+          setMessages(prev => {
+            const combined = [...sorted, ...prev];
+            return Array.from(new Map(combined.map(m => [m.id, m])).values());
+          });
+        } else {
+          setMessages(sorted);
+          setHasNewerMessages(false);
+          setIsViewingHistory(false);
+          setNewLiveMessagesCount(0);
+        }
+        setHasMoreMessages(data.length === PAGE_SIZE);
+      }
+    } catch (err) {
+      console.error("Erro ao buscar mensagens:", err);
+    } finally {
+      if (isLoadMore) setIsLoadingMore(false);
+    }
+  }, [currentUser, messages, isLoadingMore]);
+
+  const fetchNextMessages = useCallback(async () => {
+    if (!isSupabaseConfigured || !currentUser || isLoadingNext || !hasNewerMessages) return;
+    try {
+      setIsLoadingNext(true);
+      const query = supabase
+        .from('messages')
+        .select('*')
+        .gt('created_at', messages[messages.length - 1].created_at)
+        .order('created_at', { ascending: true });
+
+      const { data, error } = await query.limit(PAGE_SIZE);
+      if (error) throw error;
+
+      if (data && data.length > 0) {
+        setMessages(prev => {
+          const combined = [...prev, ...data];
+          return Array.from(new Map(combined.map(m => [m.id, m])).values());
+        });
+        setHasNewerMessages(data.length === PAGE_SIZE);
+      } else {
+        setHasNewerMessages(false);
+        setIsViewingHistory(false);
+      }
+    } catch (err) {
+      console.error("Erro ao carregar mensagens posteriores:", err);
+    } finally {
+      setIsLoadingNext(false);
+    }
+  }, [currentUser, messages, isLoadingNext, hasNewerMessages]);
+
+  const handleReloadLatest = useCallback(async () => {
+    setHasNewerMessages(false);
+    setIsViewingHistory(false);
+    setNewLiveMessagesCount(0);
+    setMessages([]);
+    await fetchMessages(false);
+  }, [fetchMessages]);
+
+  const handleEditMessage = async (id: string, text: string) => {
+    if (!isSupabaseConfigured) return;
+    await supabase.from('messages').update({ text, is_edited: true }).eq('id', id);
+  };
+
+  const handleDeleteMessage = async (id: string) => {
+    if (!isSupabaseConfigured) return;
+    await supabase.from('messages').update({ is_deleted: true }).eq('id', id);
+  };
+
+  const handleReactMessage = async (id: string, emoji: string) => {
+    if (!isSupabaseConfigured || !currentUser) return;
+    const msg = messages.find(m => m.id === id);
+    if (!msg) return;
+    const reactions = { ...(msg.reactions || {}), [currentUser.id]: emoji };
+    if (msg.reactions?.[currentUser.id] === emoji) delete reactions[currentUser.id];
+    await supabase.from('messages').update({ reactions }).eq('id', id);
+  };
+
+  const handleMarkAsRead = async (id: string) => {
+    if (!isSupabaseConfigured || id.startsWith('temp-')) return;
+    await supabase.from('messages').update({ read_at: new Date().toISOString() }).match({ id }).is('read_at', null);
+  };
+
+  const handleMarkAsDelivered = async (id: string) => {
+    if (!isSupabaseConfigured || id.startsWith('temp-')) return;
+    await supabase.from('messages').update({ delivered_at: new Date().toISOString() }).match({ id }).is('delivered_at', null);
+  };
+
+  useEffect(() => {
+    if (currentUser && isSupabaseConfigured) {
+      const channel = supabase.channel('room_capy_main')
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, payload => {
+          const newMessage = payload.new as Message;
+          setMessages(prev => {
+            const exists = prev.some(m => m.id === newMessage.id);
+            if (exists) return prev;
+
+            if (newMessage.sender_id === currentUser.id) {
+              const tempIndex = prev.findIndex(m => m.id.startsWith('temp-') && m.text === newMessage.text);
+              if (tempIndex !== -1) {
+                const newMessages = [...prev];
+                newMessages[tempIndex] = newMessage;
+                return newMessages;
+              }
+              if (isViewingHistory) {
+                handleReloadLatest();
+                return prev;
+              }
+              return [...prev, newMessage];
+            }
+
+            if (isViewingHistory || hasNewerMessages) {
+              setNewLiveMessagesCount(prevCount => prevCount + 1);
+              if (document.visibilityState === 'hidden' || isLocked) sendNotification(newMessage);
+              return prev;
+            }
+
+            if (document.visibilityState === 'hidden' || isLocked) sendNotification(newMessage);
+            handleMarkAsDelivered(newMessage.id);
+            return [...prev, newMessage];
+          });
+        })
+        .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'messages' }, payload => {
+          const updated = payload.new as Message;
+          setMessages(prev => prev.map(m => m.id === updated.id ? updated : m));
+        })
+        .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'profiles' }, payload => {
+          const updated = payload.new;
+          if (updated.id !== currentUser.id) {
+            setPartner(prev => {
+                const newState = prev ? ({ ...prev, status: updated.status, last_seen: updated.last_seen, name: updated.display_name || prev.name, avatar_url: updated.avatar_url || prev.avatar_url, bio: updated.bio || prev.bio }) : null;
+                if (newState) localStorage.setItem('capy_partner', JSON.stringify(newState));
+                return newState;
+            });
+          }
+        })
+        .on('presence', { event: 'sync' }, () => {
+          const presenceState = channel.presenceState();
+          const partnerId = currentUser.id === AUTOR_ID ? MUSA_ID : AUTOR_ID;
+          const partnerPresence = Object.values(presenceState).flat().find((p: any) => p.user_id === partnerId);
+          
+          setPartner(prev => {
+            if (!prev) return prev;
+            const newStatus = partnerPresence ? 'online' : 'offline';
+            if (prev.status === newStatus) return prev;
+            return { ...prev, status: newStatus };
+          });
+        })
+        .on('broadcast', { event: 'typing' }, ({ payload }) => { if (payload.userId !== currentUser.id) setIsPartnerTyping(payload.isTyping); })
+        .on('broadcast', { event: 'nudge' }, ({ payload }) => { if (payload.senderId !== currentUser.id) setIsShaking(true); setTimeout(() => setIsShaking(false), 500); })
+        .subscribe();
+
+      channelRef.current = channel;
+      return () => { supabase.removeChannel(channel); };
+    }
+  }, [currentUser?.id, isLocked, isViewingHistory, hasNewerMessages, sendNotification, handleReloadLatest]);
+
+  useEffect(() => {
+    const channel = channelRef.current;
+    if (!channel || !currentUser) return;
+
+    const trackPresence = async () => {
+      const shouldBeOnline = !isLocked && activeView === 'chat' && document.visibilityState === 'visible';
+      if (shouldBeOnline) {
+        await channel.track({ user_id: currentUser.id, online_at: new Date().toISOString() });
+      } else {
+        await channel.untrack();
+      }
+    };
+
+    trackPresence();
+    const handleActivity = () => trackPresence();
+    document.addEventListener('visibilitychange', handleActivity);
+    window.addEventListener('focus', handleActivity);
+    
+    return () => {
+      document.removeEventListener('visibilitychange', handleActivity);
+      window.removeEventListener('focus', handleActivity);
+    };
+  }, [currentUser, isLocked, activeView]);
+
+  const handleUnlock = (user: UserProfile) => {
+    setCurrentUser(user);
+    setPartner(getDefaultPartner(user.id));
+    setIsLocked(false);
+    localStorage.setItem('capy_active_user', JSON.stringify(user));
+    requestNotificationPermission();
+    fetchLatestProfiles(user.id);
+  };
+
+  const addMessage = async (text: string, type: 'text' | 'image' | 'audio' | 'sticker' | 'video' | 'document' = 'text', replyToId?: string) => {
+    if (!currentUser || !text.trim()) return;
+    const tempId = `temp-${Date.now()}`;
+    const optimistic: Message = { id: tempId, sender_id: currentUser.id, text, type, created_at: new Date().toISOString(), reply_to_id: replyToId, is_pending: !isOnline };
+    setMessages(prev => [...prev, optimistic]);
+
+    if (isOnline) {
+      const { error } = await supabase.from('messages').insert([{ sender_id: currentUser.id, text, type, reply_to_id: replyToId }]);
+      if (error) setMessages(prev => prev.map(m => m.id === tempId ? { ...m, is_pending: true } : m));
+    }
+  };
+
+  const handleJumpToMessage = useCallback(async (msg: Message) => {
+    if (!isSupabaseConfigured || !currentUser) return;
+    try {
+      setIsLoadingMore(true);
+      setIsLoadingNext(true);
+      const [before, after] = await Promise.all([
+        supabase.from('messages').select('*').lt('created_at', msg.created_at).order('created_at', { ascending: false }).limit(20),
+        supabase.from('messages').select('*').gt('created_at', msg.created_at).order('created_at', { ascending: true }).limit(20)
+      ]);
+      if (before.error || after.error) throw new Error("Erro ao saltar");
+      const messagesWindow = [...(before.data || []).reverse(), msg, ...(after.data || [])];
+      setMessages(messagesWindow);
+      setHasMoreMessages(before.data?.length === 20); 
+      setHasNewerMessages(after.data?.length === 20);
+      setIsViewingHistory(true);
+      setNewLiveMessagesCount(0);
+    } catch (err) { console.error(err); } finally { setIsLoadingMore(false); setIsLoadingNext(false); }
+  }, [currentUser]);
+
+  if (isLocked) return <AuthScreen onUnlock={handleUnlock} />;
+
+  return (
+    <div className={`flex flex-col h-full bg-[#000000] overflow-hidden relative ${isShaking ? 'animate-shake' : ''}`}>
+      <div className={`${activeView === 'sidebar' ? 'flex' : 'hidden'} w-full glass border-r border-white/5 z-30`}>
+        <Sidebar partner={partner || getDefaultPartner(currentUser!.id)} currentUser={currentUser!} activeView={activeView} onNavigate={(v) => setActiveView(v as ViewState)} onLogout={() => { updatePresence('offline'); localStorage.removeItem('capy_active_user'); setCurrentUser(null); setIsLocked(true); }} />
+      </div>
+      
+      <div className="flex-1 flex flex-col relative overflow-hidden">
+        <AnimatePresence mode="popLayout" custom={direction}>
+          {activeView === 'chat' && partner && currentUser && (
+            <motion.div
+              key="chat"
+              custom={direction}
+              variants={pageVariants}
+              initial="initial"
+              animate="animate"
+              exit="exit"
+              className="h-full w-full absolute top-0 left-0"
+            >
+              <ChatInterface
+                messages={messages} partner={partner} onSendMessage={addMessage} onMarkAsRead={handleMarkAsRead}
+                onSendNudge={() => channelRef.current?.send({ type: 'broadcast', event: 'nudge', payload: { senderId: currentUser.id } })}
+                onNavigateToProfile={() => navigateTo('profile')} currentUserId={currentUser.id} isPartnerTyping={isPartnerTyping}
+                onTyping={(isTyping) => {
+                  resetInactivityTimer();
+                  channelRef.current?.send({ type: 'broadcast', event: 'typing', payload: { userId: currentUser.id, isTyping } });
+                }}
+                onEditMessage={handleEditMessage} onDeleteMessage={handleDeleteMessage} onReactMessage={handleReactMessage}
+                onLoadMore={() => fetchMessages(true)} onLoadNext={fetchNextMessages} hasMore={hasMoreMessages} hasNewer={hasNewerMessages}
+                isLoadingMore={isLoadingMore} isLoadingNext={isLoadingNext} isViewingHistory={isViewingHistory} newLiveCount={newLiveMessagesCount}
+                onJumpToMessage={handleJumpToMessage} onReloadLatest={handleReloadLatest}
+              />
+            </motion.div>
+          )}
+
+          {activeView === 'library' && (
+            <motion.div
+              key="library"
+              custom={direction}
+              variants={pageVariants}
+              initial="initial"
+              animate="animate"
+              exit="exit"
+              className="h-full w-full absolute top-0 left-0"
+            >
+              <Library />
+            </motion.div>
+          )}
+
+          {activeView === 'profile' && currentUser && (
+            <motion.div
+              key="profile"
+              custom={direction}
+              variants={pageVariants}
+              initial="initial"
+              animate="animate"
+              exit="exit"
+              className="h-full w-full absolute top-0 left-0"
+            >
+              <Profile 
+                initialProfile={currentUser} 
+                onUpdate={(u) => { setCurrentUser(u); localStorage.setItem('capy_active_user', JSON.stringify(u)); }} 
+                onBack={() => navigateTo('chat')} 
+              />
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+    </div>
+  );
+};
+
+export default App;
+</file>
+
+<file path=".\capacitor.config.ts">
+import { CapacitorConfig } from '@capacitor/cli';
+
+const config: CapacitorConfig = {
+  appId: 'com.capybook.love',
+  appName: 'CapyBook Love',
+  webDir: 'dist',
+  server: {
+    androidScheme: 'https'
+  },
+  plugins: {
+    OneSignal: {
+      appId: "d4a8a2a3-3cca-4359-b644-3564cd377d76"
+    }
+  }
+};
+
+export default config;
+</file>
+
+<file path=".\index.html">
+<!DOCTYPE html>
+<html lang="pt-BR">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport"
+        content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="theme-color" content="#000000">
+    <title>CapyBook Love</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link
+        href="https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,400;0,600;0,700;1,400&family=Inter:wght@300;400;600&family=Playfair+Display:ital,wght@0,400;0,700;1,400&display=swap"
+        rel="stylesheet">
+    <style>
+        :root {
+            --color-bg-deep: #000000;
+            --color-bg-mid: #0a0a0a;
+            --color-accent: #3b82f6;
+        }
+
+        * {
+            -webkit-tap-highlight-color: transparent;
+            user-select: none;
+            box-sizing: border-box;
+        }
+
+        input,
+        textarea {
+            user-select: text !important;
+        }
+
+        html,
+        body {
+            height: 100%;
+            width: 100%;
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: var(--color-bg-deep);
+            overscroll-behavior-y: none;
+        }
+
+        #root {
+            height: 100%;
+            width: 100%;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .font-display {
+            font-family: 'Playfair Display', serif;
+        }
+
+        .font-serif {
+            font-family: 'Crimson Pro', serif;
+        }
+
+        /* Custom Scrollbar */
+        ::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+        }
+
+        /* Dark Academia Vignette - Lighter to avoid obscuring content */
+        .vignette {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            box-shadow: inset 0 0 100px rgba(0, 0, 0, 0.4);
+            pointer-events: none;
+            z-index: 50;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        @keyframes particle-burst {
+            0% { transform: translate(-50%, -50%) scale(0.5); opacity: 1; }
+            100% { transform: translate(calc(-50% + var(--dx)), calc(-50% + var(--dy))) scale(1.5); opacity: 0; }
+        }
+
+        @keyframes float-heart {
+            0% { transform: translateY(0) scale(0) rotate(0deg); opacity: 0; }
+            10% { opacity: 0.8; transform: translateY(-10vh) scale(1) rotate(10deg); }
+            100% { transform: translateY(-100vh) scale(1.5) rotate(-20deg); opacity: 0; }
+        }
+
+        .animate-particle {
+            animation: particle-burst 0.8s cubic-bezier(0.1, 0.8, 0.3, 1) forwards;
+        }
+
+        .animate-love-heart {
+            animation: float-heart 4s ease-in forwards;
+        }
+
+        .animate-in {
+            animation-duration: 0.3s;
+            animation-fill-mode: both;
+        }
+
+        .fade-in {
+            animation-name: fadeIn;
+        }
+
+        body {
+            background: radial-gradient(circle at 50% 50%, #111111 0%, #000000 100%);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100dvh;
+            color: #ffffff;
+        }
+
+        .app-container {
+            width: 100%;
+            height: 100dvh;
+            max-width: 500px;
+            position: relative;
+            background: #000000;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+
+        @media (min-width: 768px) {
+            .app-container {
+                height: 94dvh;
+                max-height: 900px;
+                border-radius: 28px;
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                box-shadow: 0 0 60px rgba(0, 0, 0, 0.8);
+            }
+        }
+    </style>
+    <script type="importmap">
+{
+  "imports": {
+    "react-dom/": "https://esm.sh/react-dom@^19.2.3/",
+    "react-dom": "https://esm.sh/react-dom@^19.2.3",
+    "react/": "https://esm.sh/react@^19.2.3/",
+    "react": "https://esm.sh/react@^19.2.3",
+    "emoji-picker-react": "https://esm.sh/emoji-picker-react@^4.16.1",
+    "@supabase/supabase-js": "https://esm.sh/@supabase/supabase-js@2.45.1",
+    "@vitejs/plugin-react": "https://esm.sh/@vitejs/plugin-react@^5.1.2",
+    "vite": "https://esm.sh/vite@^7.3.1",
+    "@capacitor/cli": "https://esm.sh/@capacitor/cli@^8.0.1",
+    "@capgo/capacitor-native-biometric": "https://esm.sh/@capgo/capacitor-native-biometric@6.0.4"
+  }
+}
+</script>
+</head>
+
+<body>
+    <div class="app-container">
+        <div id="root"></div>
+    </div>
+    <div class="vignette"></div>
+    <script type="module" src="/index.tsx"></script>
+</body>
+
+</html>
+
+</file>
+
+<file path=".\index.tsx">
+
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import App from './App';
+
+const rootElement = document.getElementById('root');
+if (!rootElement) {
+  throw new Error("Could not find root element to mount to");
+}
+
+const root = ReactDOM.createRoot(rootElement);
+root.render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+
+</file>
+
+<file path=".\manifest.json">
+{
+  "name": "CapBook",
+  "short_name": "CapBook",
+  "description": "Espaço privado para mensagens e memórias.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#081421",
+  "theme_color": "#081421",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "https://via.placeholder.com/192",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "https://via.placeholder.com/512",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
+
+</file>
+
+<file path=".\metadata.json">
+{
+  "name": "CapBook-two",
+  "description": "A personalized private messaging app for a special couple, featuring a unique 'Capybara and Dark Academia' aesthetic.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
+</file>
+
+<file path=".\package.json">
+{
+  "name": "capybook-love",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "android": "npx cap open android",
+    "sync": "npx cap sync"
+  },
+  "dependencies": {
+    "@capacitor/android": "^6.0.0",
+    "@capacitor/core": "^6.0.0",
+    "@capgo/capacitor-native-biometric": "^6.0.4",
+    "@supabase/supabase-js": "^2.45.1",
+    "emoji-picker-react": "^4.16.1",
+    "framer-motion": "^12.34.0",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^6.0.0",
+    "@types/react": "^19.2.3",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^4.2.1",
+    "autoprefixer": "^10.4.19",
+    "postcss": "^8.4.38",
+    "tailwindcss": "^3.4.3",
+    "typescript": "^5.4.5",
+    "vite": "^5.2.11"
+  }
+}
+
+</file>
+
+<file path=".\tsconfig.json">
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+
+    /* Linting */
+    "strict": true,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": ["**/*.ts", "**/*.tsx"],
+  "exclude": ["node_modules", "supabase"]
+}
+</file>
+
+<file path=".\types.ts">
+
+export interface Message {
+  id: string;
+  sender_id: string;
+  text?: string;
+  media_url?: string;
+  created_at: string;
+  delivered_at?: string;
+  read_at?: string;
+  type: 'text' | 'image' | 'audio' | 'sticker' | 'video' | 'document';
+  reactions?: Record<string, string>; // userId -> emoji
+  is_edited?: boolean;
+  is_deleted?: boolean;
+  reply_to_id?: string;
+  is_pending?: boolean;
+}
+
+export interface UserProfile {
+  id: string;
+  name: string;
+  avatar_url: string;
+  bio: string;
+  status?: 'online' | 'offline';
+  last_seen?: string;
+  pin?: string;
+}
+
+</file>
+
+<file path=".\vite.config.ts">
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+// https://vitejs.dev/config/
+export default defineConfig({
+  plugins: [react()],
+  build: {
+    outDir: 'dist',
+    emptyOutDir: true,
+  },
+  // Garante que o código funcione mesmo se servido de um sistema de arquivos local (file://)
+  base: './',
+});
+</file>
+
+<file path=".\components\AuthScreen.tsx">
+import React, { useState, useEffect, useRef } from 'react';
+import { UserProfile } from '../types';
+import { AUTOR_ID, MUSA_ID } from '../App';
+import { supabase } from '../services/supabase';
+
+interface AuthScreenProps {
+  onUnlock: (user: UserProfile) => void;
+}
+
+const AuthScreen: React.FC<AuthScreenProps> = ({ onUnlock }) => {
+  const [display, setDisplay] = useState('0');
+  const [sequence, setSequence] = useState('');
+  const [prevValue, setPrevValue] = useState<number | null>(null);
+  const [operator, setOperator] = useState<string | null>(null);
+  const [waitingForOperand, setWaitingForOperand] = useState(false);
+  const [unlocking, setUnlocking] = useState(false);
+  const pinsRef = useRef<{ [key: string]: { pin: string, profile: UserProfile } }>({});
+
+  useEffect(() => {
+    const fetchPins = async () => {
+      try {
+        const { data } = await supabase
+          .from('profiles')
+          .select('*')
+          .in('id', [AUTOR_ID, MUSA_ID]);
+        
+        if (data) {
+          data.forEach((p: any) => {
+            if (p.pin) {
+                pinsRef.current[p.id] = {
+                pin: p.pin,
+                profile: {
+                    id: p.id,
+                    name: p.display_name || 'Usuário',
+                    avatar_url: p.avatar_url || '',
+                    bio: p.bio || '',
+                    pin: p.pin
+                }
+                };
+            }
+          });
+        }
+      } catch (err) {
+        console.debug("Aguardando configuração do banco de dados.");
+      }
+    };
+    fetchPins();
+  }, []);
+
+  useEffect(() => {
+    const matchedId = Object.keys(pinsRef.current).find(id => sequence.endsWith(pinsRef.current[id].pin));
+    
+    if (matchedId) {
+      handleUnlock(matchedId);
+    }
+  }, [sequence]);
+
+  const handleUnlock = (userId: string) => {
+    setUnlocking(true);
+    let userProfile = pinsRef.current[userId]?.profile;
+    
+    if (!userProfile) {
+      const cachedUserStr = localStorage.getItem('capy_active_user');
+      if (cachedUserStr) {
+        const cachedUser = JSON.parse(cachedUserStr) as UserProfile;
+        if (cachedUser.id === userId) {
+          userProfile = cachedUser;
+        }
+      }
+    }
+    
+    if (!userProfile) {
+        userProfile = {
+            id: userId,
+            name: 'Usuário',
+            avatar_url: '',
+            bio: '',
+            pin: ''
+        };
+    }
+
+    // Vibração mais "snappy" (curta e precisa)
+    if (navigator.vibrate) navigator.vibrate([10, 50]);
+    
+    // REDUZIDO: de 1500ms para 800ms (UX mais ágil)
+    setTimeout(() => {
+      onUnlock(userProfile!);
+    }, 800);
+  };
+
+  const inputDigit = (digit: string) => {
+    if (navigator.vibrate) navigator.vibrate(5);
+    setSequence(prev => (prev + digit).slice(-10));
+    if (waitingForOperand) {
+      setDisplay(digit);
+      setWaitingForOperand(false);
+    } else {
+      if (display.length >= 11) return;
+      setDisplay(display === '0' ? digit : display + digit);
+    }
+  };
+
+  const inputDot = () => {
+    if (navigator.vibrate) navigator.vibrate(5);
+    if (waitingForOperand) {
+      setDisplay('0.');
+      setWaitingForOperand(false);
+    } else if (!display.includes('.')) {
+      setDisplay(display + '.');
+    }
+  };
+
+  const clearDisplay = () => {
+    if (navigator.vibrate) navigator.vibrate(5);
+    setDisplay('0');
+    setPrevValue(null);
+    setOperator(null);
+    setWaitingForOperand(false);
+    setSequence('');
+  };
+
+  const performOperation = (nextOperator: string) => {
+    if (navigator.vibrate) navigator.vibrate(5);
+    const inputValue = parseFloat(display);
+    if (prevValue === null) {
+      setPrevValue(inputValue);
+    } else if (operator) {
+      const currentValue = prevValue || 0;
+      const newValue = calculate(currentValue, inputValue, operator);
+      if (isNaN(newValue)) {
+        setDisplay('Erro');
+        setPrevValue(null);
+      } else {
+        setDisplay(String(newValue).slice(0, 11));
+        setPrevValue(newValue);
+      }
+    }
+    setWaitingForOperand(true);
+    setOperator(nextOperator);
+  };
+
+  const calculate = (prev: number, next: number, op: string) => {
+    let result = 0;
+    switch (op) {
+      case '+': result = prev + next; break;
+      case '-': result = prev - next; break;
+      case '*': result = prev * next; break;
+      case '/': if (next === 0) return NaN; result = prev / next; break;
+      default: result = next;
+    }
+    return parseFloat(result.toPrecision(12));
+  };
+
+  const handleEqual = () => {
+    if (navigator.vibrate) navigator.vibrate(10);
+    const inputValue = parseFloat(display);
+    if (operator && prevValue !== null) {
+      const result = calculate(prevValue, inputValue, operator);
+      if (isNaN(result)) {
+        setDisplay('Erro');
+        setPrevValue(null);
+      } else {
+        setDisplay(String(result).slice(0, 11));
+        setPrevValue(result);
+      }
+      setOperator(null);
+      setWaitingForOperand(true);
+    }
+  };
+
+  const calcBtn = "flex items-center justify-center text-2xl font-medium transition-all active:scale-95 duration-100";
+  const numBtn = `${calcBtn} bg-[#1c1c1e] text-white rounded-2xl hover:bg-[#2c2c2e]`;
+  const opBtn = `${calcBtn} bg-[#2c2c2e] text-blue-400 rounded-2xl hover:bg-[#3a3a3c]`;
+  const actionBtn = `${calcBtn} bg-blue-600 text-white rounded-2xl hover:bg-blue-500 shadow-lg shadow-blue-900/20`;
+
+  return (
+    <div className="h-screen w-full flex flex-col bg-[#000000] relative overflow-hidden font-serif select-none touch-none">
+      <div className={`flex flex-col h-full w-full transition-all duration-700 cubic-bezier(0.25, 1, 0.5, 1) ${unlocking ? 'scale-110 opacity-0 filter blur-xl' : 'scale-100'}`}>
+        
+        {/* Display refined */}
+        <div className="pt-24 px-10 pb-10 flex flex-col justify-end min-h-[35%]">
+            <div className="text-right mb-4">
+                <span className="text-[10px] uppercase tracking-[0.6em] text-zinc-600 font-black opacity-60">Scientific Engine v2</span>
+            </div>
+            <div className="text-right text-7xl font-display text-white truncate transition-all leading-tight overflow-hidden tracking-tighter">
+                {display}
+            </div>
+        </div>
+
+        {/* Grid refined */}
+        <div className="flex-1 grid grid-cols-4 gap-3 px-6 pb-8">
+          <button onClick={clearDisplay} className={opBtn}>AC</button>
+          <button onClick={() => performOperation('/')} className={`${opBtn} ${operator === '/' ? 'bg-blue-600 text-white' : ''}`}>÷</button>
+          <button onClick={() => performOperation('*')} className={`${opBtn} ${operator === '*' ? 'bg-blue-600 text-white' : ''}`}>×</button>
+          <button onClick={() => {}} className={opBtn}>+/-</button>
+          
+          <button onClick={() => inputDigit('7')} className={numBtn}>7</button>
+          <button onClick={() => inputDigit('8')} className={numBtn}>8</button>
+          <button onClick={() => inputDigit('9')} className={numBtn}>9</button>
+          <button onClick={() => performOperation('-')} className={`${opBtn} ${operator === '-' ? 'bg-blue-600 text-white' : ''}`}>−</button>
+          
+          <button onClick={() => inputDigit('4')} className={numBtn}>4</button>
+          <button onClick={() => inputDigit('5')} className={numBtn}>5</button>
+          <button onClick={() => inputDigit('6')} className={numBtn}>6</button>
+          <button onClick={() => performOperation('+')} className={`${opBtn} ${operator === '+' ? 'bg-blue-600 text-white' : ''}`}>+</button>
+          
+          <button onClick={() => inputDigit('1')} className={numBtn}>1</button>
+          <button onClick={() => inputDigit('2')} className={numBtn}>2</button>
+          <button onClick={() => inputDigit('3')} className={numBtn}>3</button>
+          <button onClick={handleEqual} className={actionBtn}>=</button>
+          
+          <button onClick={() => inputDigit('0')} className={`${numBtn} col-span-2 text-left px-10`}>0</button>
+          <button onClick={inputDot} className={numBtn}>.</button>
+          <div className="bg-transparent"></div>
+        </div>
+
+        <div className="h-[env(safe-area-inset-bottom)] bg-black"></div>
+      </div>
+
+      {/* Pure Animation Overlays */}
+      {unlocking && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/40 backdrop-blur-sm animate-in fade-in duration-300">
+           <div className="relative flex items-center justify-center">
+              {/* Expanding Rings - Custom Keyframes for cleaner animation */}
+              <div 
+                className="absolute w-20 h-20 rounded-full border-2 border-blue-400 opacity-0"
+                style={{ animation: 'ringExpand 0.8s cubic-bezier(0, 0, 0.2, 1) forwards' }}
+              ></div>
+              <div 
+                className="absolute w-20 h-20 rounded-full border border-blue-500/50 opacity-0"
+                style={{ animation: 'ringExpand 0.8s cubic-bezier(0, 0, 0.2, 1) 0.15s forwards' }}
+              ></div>
+              
+              {/* Central Heart - Elastic Pop Effect */}
+              <div 
+                 className="relative z-10"
+                 style={{ animation: 'heartPop 0.6s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards' }}
+              >
+                 <i className="fa-solid fa-heart text-7xl text-blue-500 drop-shadow-[0_0_15px_rgba(59,130,246,0.8)]"></i>
+              </div>
+           </div>
+           
+           {/* Final White Flash for Transition */}
+           <div className="fixed inset-0 bg-white opacity-0" style={{ animation: 'flash 0.4s ease-out 0.6s forwards' }}></div>
+        </div>
+      )}
+
+      <style>{`
+        @keyframes ringExpand {
+          0% { transform: scale(0.5); opacity: 1; border-width: 4px; }
+          100% { transform: scale(4); opacity: 0; border-width: 0px; }
+        }
+        @keyframes heartPop {
+          0% { transform: scale(0); opacity: 0; }
+          40% { transform: scale(1.3); opacity: 1; }
+          100% { transform: scale(1); opacity: 1; }
+        }
+        @keyframes flash {
+          0% { opacity: 0; }
+          50% { opacity: 0.2; }
+          100% { opacity: 0; }
+        }
+      `}</style>
+    </div>
+  );
+};
+
+export default AuthScreen;
+</file>
+
+<file path=".\components\ChatInterface.tsx">
+import React, { useState, useRef, useEffect, useLayoutEffect, memo, useMemo, useCallback } from 'react';
+import { Message, UserProfile } from '../types';
+import EmojiPicker, { Theme, EmojiClickData } from 'emoji-picker-react';
+import { supabase, isSupabaseConfigured } from '../services/supabase';
+import ImageModal from './ImageModal';
+import ParticleBurst from './ParticleBurst';
+import LoveAnimation from './LoveAnimation';
+
+// --- ESTILOS DE ANIMAÇÃO (Injetados) ---
+const ELASTIC_STYLES = `
+  @keyframes msgPopIn {
+    0% { opacity: 0; transform: scale(0.9) translateY(20px); }
+    100% { opacity: 1; transform: scale(1) translateY(0); }
+  }
+  .msg-elastic {
+    animation: msgPopIn 0.6s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+    opacity: 0; /* Começa invisível para não piscar */
+  }
+`;
+
+// --- (Interfaces e Constantes mantidas) ---
+interface ChatInterfaceProps {
+  messages: Message[];
+  partner: UserProfile;
+  onSendMessage: (text: string, type?: 'text' | 'sticker' | 'image' | 'audio' | 'video' | 'document', replyToId?: string) => void;
+  onMarkAsRead: (messageId: string) => void;
+  onSendNudge: () => void;
+  onNavigateToProfile: () => void;
+  currentUserId: string;
+  isPartnerTyping?: boolean;
+  onTyping?: (isTyping: boolean) => void;
+  onEditMessage: (id: string, newText: string) => void;
+  onDeleteMessage: (id: string) => void;
+  onReactMessage: (id: string, emoji: string) => void;
+  onLoadMore: () => void;
+  onLoadNext: () => void;
+  hasMore: boolean;
+  hasNewer: boolean;
+  isLoadingMore: boolean;
+  isLoadingNext: boolean;
+  isViewingHistory: boolean;
+  newLiveCount: number;
+  onJumpToMessage: (msg: Message) => Promise<void>;
+  onReloadLatest: () => Promise<void>;
+}
+
+const STORAGE_URL = 'https://yggpwbvhyieaqvwwjcot.supabase.co/storage/v1/object/public/CapyBook';
+const REACTION_EMOJIS = ["❤️", "😂", "😍", "😆", "😮", "😢", "😡", "👍", "🤔", "🙏"];
+const FREQUENT_EMOJIS = ["❤️", "😂", "😍", "😆", "😮"];
+
+// --- Componentes Auxiliares ---
+
+const TypingIndicator = memo(() => (
+  <div className="flex items-center gap-1">
+    <span className="text-[10px] font-semibold animate-pulse">digitando</span>
+    <div className="flex gap-0.5">
+        <div className="w-1 h-1 bg-blue-500 rounded-full animate-[bounce_1s_infinite_0ms]"></div>
+        <div className="w-1 h-1 bg-blue-500 rounded-full animate-[bounce_1s_infinite_200ms]"></div>
+        <div className="w-1 h-1 bg-blue-500 rounded-full animate-[bounce_1s_infinite_400ms]"></div>
+    </div>
+  </div>
+));
+
+const DateDivider = memo(({ date }: { date: string }) => {
+  const label = useMemo(() => {
+    const d = new Date(date);
+    const today = new Date();
+    const yesterday = new Date();
+    yesterday.setDate(today.getDate() - 1);
+    if (d.toDateString() === today.toDateString()) return 'Hoje';
+    if (d.toDateString() === yesterday.toDateString()) return 'Ontem';
+    return d.toLocaleDateString('pt-BR', { day: 'numeric', month: 'long' });
+  }, [date]);
+  return (
+    <div className="flex items-center justify-center my-6 select-none animate-in fade-in duration-500">
+      <div className="h-[0.5px] flex-1 bg-zinc-800/50"></div>
+      <span className="px-3 text-[10px] uppercase font-black text-zinc-600 font-serif italic tracking-widest">{label}</span>
+      <div className="h-[0.5px] flex-1 bg-zinc-800/50"></div>
+    </div>
+  );
+});
+
+const renderMessageText = (text: string, isMe: boolean, searchQuery?: string) => {
+  if (!text) return null;
+  const urlRegex = /(https?:\/\/[^\s]+)/g;
+  const parts = text.split(urlRegex);
+  return parts.map((part, i) => {
+    if (part.match(urlRegex)) {
+      return <a key={i} href={part} target="_blank" rel="noopener noreferrer" className={`underline break-all transition-opacity hover:opacity-70 text-blue-300`} onClick={(e) => e.stopPropagation()}>{part}</a>;
+    }
+    if (searchQuery && searchQuery.trim().length > 1) {
+      const escapedQuery = searchQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const searchRegex = new RegExp(`(${escapedQuery})`, 'gi');
+      const searchParts = part.split(searchRegex);
+      return searchParts.map((sPart, j) => {
+        if (sPart.toLowerCase() === searchQuery.toLowerCase()) {
+          return <span key={`${i}-${j}`} className="bg-yellow-400/80 text-black font-bold rounded-[2px] px-0.5">{sPart}</span>;
+        }
+        return sPart;
+      });
+    }
+    return part;
+  });
+};
+
+const AudioPlayer = ({ url, isMe }: { url: string; isMe: boolean }) => {
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const bars = useMemo(() => Array.from({ length: 16 }, () => Math.random() * 80 + 20), []);
+  const togglePlay = () => {
+    if (audioRef.current) {
+      if (isPlaying) audioRef.current.pause();
+      else audioRef.current.play();
+      setIsPlaying(!isPlaying);
+    }
+  };
+  return (
+    <div className="flex items-center gap-2.5 min-w-[150px] py-1">
+      <audio ref={audioRef} src={url} onTimeUpdate={() => setProgress((audioRef.current!.currentTime / audioRef.current!.duration) * 100)} onEnded={() => setIsPlaying(false)} />
+      <button onClick={togglePlay} className={`w-7 h-7 rounded-full flex items-center justify-center shadow-md transition-all active:scale-90 ${isMe ? 'bg-white text-blue-600' : 'bg-blue-500 text-white'}`}>
+        <i className={`fa-solid ${isPlaying ? 'fa-pause' : 'fa-play'} text-[9px]`}></i>
+      </button>
+      <div className="flex-1 flex items-end gap-[2px] h-5 px-1">
+        {bars.map((height, i) => (
+          <div key={i} className={`flex-1 rounded-full transition-all duration-300 ${progress > (i / bars.length) * 100 ? (isMe ? 'bg-white' : 'bg-blue-400') : (isMe ? 'bg-white/20' : 'bg-white/10')}`} style={{ height: `${height}%` }} />
+        ))}
+      </div>
+    </div>
+  );
+};
+
+// --- Message Item ---
+
+interface MessageItemProps {
+  msg: Message;
+  isMe: boolean;
+  currentUserId: string;
+  partner: UserProfile;
+  isMenuOpen: boolean;
+  isEditing: boolean;
+  index: number;
+  onReactMessage: (id: string, emoji: string) => void;
+  onDeleteMessage: (id: string) => void;
+  onEditMessage: (id: string, newText: string) => void;
+  onStartReply: (msg: Message) => void;
+  onSetMenuOpen: (id: string | null) => void;
+  onSetEditing: (id: string | null) => void;
+  onPreviewImage: (url: string) => void;
+  renderReplyContext: (replyToId: string | undefined, isMe: boolean) => React.ReactNode;
+  renderStatus: (msg: Message) => React.ReactNode;
+  onMediaLoad?: () => void;
+  searchQuery?: string;
+  isHighlighted?: boolean;
+  animDelay?: number;
+}
+
+const MessageItem = memo(({
+  msg, isMe, currentUserId, partner, isMenuOpen, isEditing, index, onReactMessage, onDeleteMessage, onEditMessage, onStartReply, onSetMenuOpen, onSetEditing, onPreviewImage, renderReplyContext, renderStatus, onMediaLoad, searchQuery, isHighlighted, animDelay = 0
+}: MessageItemProps) => {
+  const reactionsList = Object.entries(msg.reactions || {});
+  const [editText, setEditText] = useState(msg.text || '');
+  const [burst, setBurst] = useState<{ x: number, y: number } | null>(null);
+  
+  // NOVO: Ref para o container raiz (wrapper) para calcular coordenadas locais
+  const rootRef = useRef<HTMLDivElement>(null);
+  
+  const containerRef = useRef<HTMLDivElement>(null);
+  const swipeIndicatorRef = useRef<HTMLDivElement>(null);
+  const startCoords = useRef({ x: 0, y: 0 });
+  const currentOffset = useRef(0);
+  const isLockingGesture = useRef<'none' | 'swipe' | 'scroll'>('none');
+  const lastTapRef = useRef<number>(0);
+  
+  const menuRef = useRef<HTMLDivElement>(null);
+  const editRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    if (isEditing && editRef.current) {
+      editRef.current.style.height = 'auto';
+      editRef.current.style.height = `${editRef.current.scrollHeight}px`;
+      const len = editRef.current.value.length;
+      editRef.current.setSelectionRange(len, len);
+      editRef.current.focus();
+    }
+  }, [isEditing]);
+
+  useEffect(() => {
+    if (isMenuOpen) {
+      const handleClick = (e: MouseEvent) => { if (menuRef.current && !menuRef.current.contains(e.target as Node)) onSetMenuOpen(null); };
+      document.addEventListener('mousedown', handleClick);
+      return () => document.removeEventListener('mousedown', handleClick);
+    }
+  }, [isMenuOpen, onSetMenuOpen]);
+
+  // CORREÇÃO: Cálculo de coordenadas locais
+  const processTap = useCallback((clientX: number, clientY: number) => {
+    const now = Date.now();
+    const timeDiff = now - lastTapRef.current;
+    if (timeDiff < 300 && timeDiff > 0) {
+      onReactMessage(msg.id, "❤️");
+      
+      // Calcula coordenadas relativas ao elemento, não à tela inteira
+      let finalX = clientX;
+      let finalY = clientY;
+      
+      if (rootRef.current) {
+        const rect = rootRef.current.getBoundingClientRect();
+        finalX = clientX - rect.left;
+        finalY = clientY - rect.top;
+      }
+
+      setBurst({ x: finalX, y: finalY });
+      if (navigator.vibrate) navigator.vibrate([10, 30]);
+      lastTapRef.current = 0;
+    } else {
+      lastTapRef.current = now;
+      setTimeout(() => {
+        if (Date.now() - lastTapRef.current >= 300 && lastTapRef.current !== 0) {
+          onSetMenuOpen(msg.id);
+          if (navigator.vibrate) navigator.vibrate(15);
+        }
+      }, 310);
+    }
+  }, [msg.id, onReactMessage, onSetMenuOpen]);
+
+  const updateSwipeVisuals = (offset: number) => {
+    if (containerRef.current) {
+        const elastic = offset > 0 ? Math.pow(offset, 0.8) * 2.5 : 0;
+        containerRef.current.style.transform = `translateX(${elastic}px)`;
+        if (swipeIndicatorRef.current) {
+             const opacity = offset > 15 ? Math.min((offset - 15) / 50, 1) : 0;
+             const scale = Math.min(elastic / 45, 1.05);
+             const indicatorTrans = Math.min(elastic, 45);
+             swipeIndicatorRef.current.style.opacity = String(opacity);
+             swipeIndicatorRef.current.style.transform = `translateX(${indicatorTrans}px) scale(${scale})`;
+             const icon = swipeIndicatorRef.current.querySelector('i');
+             if (icon) {
+                 if (offset > 70) {
+                     icon.classList.add('text-blue-400');
+                     icon.classList.remove('text-zinc-700');
+                 } else {
+                     icon.classList.remove('text-blue-400');
+                     icon.classList.add('text-zinc-700');
+                 }
+             }
+        }
+    }
+  };
+
+  const resetSwipe = () => {
+      if (containerRef.current) {
+          containerRef.current.style.transition = 'transform 0.3s cubic-bezier(0.33, 1, 0.68, 1)';
+          containerRef.current.style.transform = 'translateX(0px)';
+          setTimeout(() => { if (containerRef.current) containerRef.current.style.transition = ''; }, 300);
+      }
+      if (swipeIndicatorRef.current) {
+          swipeIndicatorRef.current.style.opacity = '0';
+          swipeIndicatorRef.current.style.transform = 'translateX(0px)';
+      }
+      currentOffset.current = 0;
+  };
+
+  const onTouchStart = (e: React.TouchEvent) => {
+    const touch = e.touches[0];
+    startCoords.current = { x: touch.clientX, y: touch.clientY };
+    isLockingGesture.current = 'none';
+    if (containerRef.current) containerRef.current.style.transition = 'none';
+  };
+
+  const onTouchMove = (e: React.TouchEvent) => {
+    const touch = e.touches[0];
+    const dx = touch.clientX - startCoords.current.x;
+    const dy = touch.clientY - startCoords.current.y;
+    if (isLockingGesture.current === 'none') {
+      if (Math.abs(dx) > 10 && Math.abs(dx) > Math.abs(dy)) isLockingGesture.current = 'swipe';
+      else if (Math.abs(dy) > 10) isLockingGesture.current = 'scroll';
+    }
+    if (isLockingGesture.current === 'swipe' && dx > 0) {
+       if (e.cancelable) e.preventDefault();
+       currentOffset.current = dx;
+       updateSwipeVisuals(dx);
+    }
+  };
+
+  const onTouchEnd = (e: React.TouchEvent) => {
+    const dx = e.changedTouches[0].clientX - startCoords.current.x;
+    const dy = e.changedTouches[0].clientY - startCoords.current.y;
+    if (isLockingGesture.current === 'swipe') {
+        if (currentOffset.current > 70) { onStartReply(msg); if (navigator.vibrate) navigator.vibrate(30); }
+        resetSwipe();
+    } else if (Math.abs(dx) < 10 && Math.abs(dy) < 10) {
+        processTap(e.changedTouches[0].clientX, e.changedTouches[0].clientY);
+    }
+    isLockingGesture.current = 'none';
+  };
+
+  const onMouseDown = (e: React.MouseEvent) => {
+    startCoords.current = { x: e.clientX, y: e.clientY };
+    if (containerRef.current) containerRef.current.style.transition = 'none';
+  };
+  const onMouseMove = (e: React.MouseEvent) => {
+      if (e.buttons === 1) {
+          const dx = e.clientX - startCoords.current.x;
+          if (dx > 10) updateSwipeVisuals(dx);
+          currentOffset.current = dx;
+      }
+  };
+  const onMouseUp = (e: React.MouseEvent) => {
+      if (currentOffset.current > 70) onStartReply(msg);
+      const dx = e.clientX - startCoords.current.x;
+      if (Math.abs(dx) < 10) processTap(e.clientX, e.clientY);
+      resetSwipe();
+  };
+  const onMouseLeave = () => { if (currentOffset.current > 0) resetSwipe(); };
+
+  return (
+    <div 
+        ref={rootRef} // ADICIONADO REF AQUI
+        data-id={msg.id} 
+        className={`flex ${isMe ? 'justify-end' : 'justify-start'} w-full relative transform-gpu my-1 msg-elastic`}
+        style={{ animationDelay: `${animDelay}s` }}
+    >
+      <div ref={swipeIndicatorRef} className="absolute left-[-35px] top-1/2 -translate-y-1/2 transition-all duration-200 pointer-events-none opacity-0">
+          <i className="fa-solid fa-reply text-sm text-zinc-700"></i>
+      </div>
+      {burst && <ParticleBurst x={burst.x} y={burst.y} emoji="❤️" onComplete={() => setBurst(null)} />}
+      <div 
+        ref={containerRef}
+        className={`relative max-w-[85%] md:max-w-[70%] will-change-transform`} 
+        onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd} 
+        onMouseDown={onMouseDown} onMouseMove={onMouseMove} onMouseUp={onMouseUp} onMouseLeave={onMouseLeave}
+      >
+        {isMenuOpen && (
+          <div ref={menuRef} className={`absolute z-50 bottom-full mb-1.5 ${isMe ? 'right-0' : 'left-0'} bg-[#1e293b] border border-blue-500/20 rounded-xl shadow-2xl p-1.5 min-w-[170px] animate-in fade-in zoom-in duration-200 origin-bottom`}>
+            <div className="flex flex-wrap justify-center gap-1.5 p-1.5 border-b border-white/5 mb-1 bg-[#0f172a]/50 rounded-t-lg">{REACTION_EMOJIS.map(emoji => <button key={emoji} onClick={(e) => { e.stopPropagation(); onReactMessage(msg.id, emoji); onSetMenuOpen(null); }} className="hover:scale-125 transition-transform text-base w-7 h-7 flex items-center justify-center">{emoji}</button>)}</div>
+            <button onClick={(e) => { e.stopPropagation(); onStartReply(msg); onSetMenuOpen(null); }} className="w-full text-left px-3.5 py-2.5 text-xs text-blue-100 hover:bg-white/5 rounded-lg flex items-center gap-2 mb-0.5"><i className="fa-solid fa-reply text-blue-400"></i> Responder</button>
+            {isMe && msg.type === 'text' && <button onClick={(e) => { e.stopPropagation(); onSetEditing(msg.id); onSetMenuOpen(null); }} className="w-full text-left px-3.5 py-2.5 text-xs text-blue-100 hover:bg-white/5 rounded-lg flex items-center gap-2 mb-0.5"><i className="fa-solid fa-pen text-blue-400"></i> Editar</button>}
+            {isMe && <button onClick={(e) => { e.stopPropagation(); onDeleteMessage(msg.id); onSetMenuOpen(null); }} className="w-full text-left px-3.5 py-2.5 text-xs text-red-400 hover:bg-red-500/10 rounded-lg flex items-center gap-2"><i className="fa-solid fa-trash text-blue-400"></i> Excluir</button>}
+          </div>
+        )}
+        <div className={`px-3.5 py-2 shadow-sm relative transition-all active:scale-[0.99] group select-text ${isMe ? 'bg-[#007AFF] text-white rounded-[19px] rounded-tr-[4px]' : 'bg-[#262626] text-white rounded-[19px] rounded-tl-[4px]'} ${isHighlighted ? 'ring-2 ring-blue-400 ring-offset-2 ring-offset-black animate-[pulse_1.5s_infinite]' : ''}`} style={{ touchAction: 'pan-y' }}>
+          {renderReplyContext(msg.reply_to_id, isMe)}
+          {isEditing ? (
+            <div className="min-w-[190px]">
+              <textarea ref={editRef} value={editText} onChange={(e) => setEditText(e.target.value)} className="w-full bg-black/20 text-white p-2.5 rounded-lg text-[14px] border-none focus:outline-none focus:ring-0 mb-1.5 resize-none overflow-hidden font-serif leading-relaxed" autoFocus />
+              <div className="flex justify-end gap-2.5"><button onClick={() => onSetEditing(null)} className="text-[9px] text-white/70 font-black uppercase">Cancelar</button><button onClick={() => { onEditMessage(msg.id, editText); onSetEditing(null); }} className="text-[9px] text-white font-black uppercase">Salvar</button></div>
+            </div>
+          ) : (
+            <>
+              {msg.type === 'audio' ? <AudioPlayer url={msg.text!} isMe={isMe} /> : msg.type === 'image' || msg.type === 'sticker' ? (
+                <img src={msg.text} onLoad={onMediaLoad} onClick={() => msg.type === 'image' && onPreviewImage(msg.text!)} className={`${msg.type === 'sticker' ? 'w-26' : 'w-44 md:w-60'} rounded-lg cursor-pointer`} />
+              ) : msg.type === 'video' ? (
+                <video src={msg.text} controls onLoadedData={onMediaLoad} className="w-60 md:w-72 rounded-lg bg-black/20" />
+              ) : msg.type === 'document' ? (
+                <div className="flex items-center gap-2.5 p-2.5 bg-black/20 rounded-lg min-w-[180px]"><div className="w-9 h-9 rounded-lg bg-white/20 flex items-center justify-center text-white"><i className="fa-solid fa-file-lines text-base"></i></div><div className="flex-1 min-w-0"><p className="text-xs font-bold truncate text-white">Arquivo</p><a href={msg.text} download target="_blank" rel="noopener noreferrer" className="text-[11px] text-blue-200 underline">Baixar</a></div><i className="fa-solid fa-download text-[10px] text-white/50"></i></div>
+              ) : <p className="font-serif text-[15px] leading-[1.38] break-words whitespace-pre-wrap select-text">{renderMessageText(msg.text!, isMe, searchQuery)}</p>}
+              {msg.is_edited && <span className="text-[9px] text-white/50 italic block mt-0.5">(editado)</span>}
+            </>
+          )}
+          {reactionsList.length > 0 && <div className={`absolute -bottom-2.5 ${isMe ? 'right-2' : 'left-2'} flex bg-[#262626] rounded-full border border-white/10 px-1.5 py-0.5 shadow-lg scale-90 z-10`}>{reactionsList.map(([uid, emoji], idx) => <span key={idx} className="text-[11px] mx-0.5">{emoji}</span>)}</div>}
+          <div className={`flex items-center gap-1.5 mt-1 ${isMe ? 'justify-end' : 'justify-start'}`}>
+            <span className="text-[9px] font-black uppercase text-white/60 tracking-tighter">{new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+            {renderStatus(msg)}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+});
+
+// --- Footer mantido igual ---
+const ChatInputFooter = memo(({ onSendMessage, onTyping, replyingTo, onCancelReply, partnerName, currentUserId, onFileClick }: any) => {
+  const [inputText, setInputText] = useState('');
+  const [showEmojis, setShowEmojis] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingTime, setRecordingTime] = useState(0);
+  const mediaRecorder = useRef<MediaRecorder | null>(null);
+  const audioChunks = useRef<Blob[]>([]);
+  const timerRef = useRef<any>(null);
+  const typingTimeoutRef = useRef<any>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const emojiPickerRef = useRef<HTMLDivElement>(null);
+  const emojiButtonRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (showEmojis) {
+      const handleClickOutside = (event: MouseEvent) => { if (emojiPickerRef.current && !emojiPickerRef.current.contains(event.target as Node) && emojiButtonRef.current && !emojiButtonRef.current.contains(event.target as Node)) setShowEmojis(false); };
+      document.addEventListener('mousedown', handleClickOutside);
+      return () => document.removeEventListener('mousedown', handleClickOutside);
+    }
+  }, [showEmojis]);
+
+  useEffect(() => { if (replyingTo && !isRecording) textareaRef.current?.focus(); }, [replyingTo, isRecording]);
+  useEffect(() => { const textarea = textareaRef.current; if (textarea) { textarea.style.height = 'auto'; textarea.style.height = `${Math.min(textarea.scrollHeight, 110)}px`; } }, [inputText]);
+  useEffect(() => { return () => { if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current); }; }, []);
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const text = e.target.value;
+    setInputText(text);
+    if (text.trim().length > 0) {
+      if (!typingTimeoutRef.current) onTyping?.(true);
+      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+      typingTimeoutRef.current = setTimeout(() => { onTyping?.(false); typingTimeoutRef.current = null; }, 2000);
+    } else {
+      if (typingTimeoutRef.current) { clearTimeout(typingTimeoutRef.current); typingTimeoutRef.current = null; }
+      onTyping?.(false);
+    }
+  };
+
+  const handleStartRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream);
+      audioChunks.current = [];
+      recorder.ondataavailable = (e) => audioChunks.current.push(e.data);
+      recorder.onstop = () => { };
+      recorder.start();
+      mediaRecorder.current = recorder;
+      setIsRecording(true);
+      setRecordingTime(0);
+      timerRef.current = setInterval(() => setRecordingTime(t => t + 1), 1000);
+      if (navigator.vibrate) navigator.vibrate(50);
+      if (typingTimeoutRef.current) { clearTimeout(typingTimeoutRef.current); typingTimeoutRef.current = null; }
+      onTyping?.(false);
+    } catch (err) { alert("Erro microfone."); }
+  };
+
+  const handleStopAndSend = async () => {
+    if (!mediaRecorder.current) return;
+    mediaRecorder.current.onstop = async () => {
+      clearInterval(timerRef.current);
+      const audioBlob = new Blob(audioChunks.current, { type: 'audio/webm' });
+      const fileName = `${currentUserId}-${Date.now()}.webm`;
+      try {
+        const { error } = await supabase.storage.from('CapyBook').upload(`chat-media/${fileName}`, audioBlob);
+        if (error) throw error;
+        const { data } = supabase.storage.from('CapyBook').getPublicUrl(`chat-media/${fileName}`);
+        if (data) { onSendMessage(data.publicUrl, 'audio', replyingTo?.id); onCancelReply(); }
+      } catch (e) { alert("Erro envio audio."); }
+      mediaRecorder.current?.stream.getTracks().forEach(track => track.stop());
+      setIsRecording(false);
+      setRecordingTime(0);
+    };
+    mediaRecorder.current.stop();
+  };
+
+  const handleCancelRecording = () => {
+    if (mediaRecorder.current) {
+      mediaRecorder.current.stop();
+      mediaRecorder.current.stream.getTracks().forEach(track => track.stop());
+    }
+    clearInterval(timerRef.current);
+    setIsRecording(false);
+    setRecordingTime(0);
+    audioChunks.current = [];
+  };
+
+  const formatTime = (seconds: number) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}:${secs < 10 ? '0' : ''}${secs}`;
+  };
+
+  const handleSendText = () => {
+    if (inputText.trim()) {
+      onSendMessage(inputText, 'text', replyingTo?.id);
+      setInputText('');
+      onCancelReply();
+      if (textareaRef.current) textareaRef.current.style.height = 'auto';
+      if (typingTimeoutRef.current) { clearTimeout(typingTimeoutRef.current); typingTimeoutRef.current = null; }
+      onTyping?.(false);
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSendText(); } };
+
+  return (
+    <footer className="flex-shrink-0 bg-black border-t border-zinc-800/50 z-20 relative pt-2 px-2.5 pb-2 md:pb-3.5 transform-gpu" style={{ paddingBottom: 'calc(env(safe-area-inset-bottom) + 0.4rem)' }}>
+      {replyingTo && !isRecording && (
+        <div className="max-w-4xl mx-auto mb-2 bg-[#1c1c1e] border-l-4 border-blue-500 rounded-r-lg p-2.5 flex justify-between items-center shadow-lg animate-in slide-in-from-bottom-2 duration-200">
+          <div className="overflow-hidden flex-1"><p className="text-[9px] text-blue-500 font-bold uppercase tracking-widest">Respondendo</p><p className="text-[12px] text-zinc-300 line-clamp-1 font-serif italic">{replyingTo.text || 'Mídia'}</p></div>
+          <button onClick={onCancelReply} className="w-6 h-6 flex items-center justify-center text-zinc-500 bg-white/5 rounded-full"><i className="fa-solid fa-xmark text-xs"></i></button>
+        </div>
+      )}
+      {!isRecording && (
+        <div className="max-w-4xl mx-auto flex gap-2 overflow-x-auto scrollbar-hide mb-2 px-1">
+          {FREQUENT_EMOJIS.map(e => (
+            <button key={e} onClick={() => setInputText(p => p + e)} className="w-9 h-9 shrink-0 flex items-center justify-center bg-zinc-900 hover:bg-zinc-800 rounded-full text-lg transition-colors border border-white/5 shadow-sm">{e}</button>
+          ))}
+        </div>
+      )}
+      <div className={`max-w-4xl mx-auto flex items-end gap-2 bg-[#1c1c1e] rounded-[22px] px-2.5 py-1.5 shadow-xl border border-white/5 ${isRecording ? 'border-red-500/30' : ''}`}>
+        {!isRecording ? (
+          <>
+            <button ref={emojiButtonRef} onClick={() => setShowEmojis(!showEmojis)} className="w-9 h-9 flex-shrink-0 text-blue-500 flex items-center justify-center rounded-full"><i className="fa-solid fa-face-smile text-xl"></i></button>
+            <button onClick={onFileClick} className="w-9 h-9 flex-shrink-0 text-blue-500 flex items-center justify-center rounded-full"><i className="fa-solid fa-paperclip text-xl"></i></button>
+            <textarea ref={textareaRef} value={inputText} onChange={handleInputChange} onKeyDown={handleKeyDown} placeholder="Mande um carinho..." className="flex-1 bg-transparent border-none focus:ring-0 outline-none focus:outline-none text-white text-[15px] py-2 font-serif placeholder-zinc-500 resize-none max-h-[110px] overflow-y-auto custom-scrollbar leading-snug" rows={1} />
+            <div className="w-[1px] h-6 bg-zinc-800/50 mb-1.5 mx-0.5"></div>
+            {inputText.trim() ? (
+              <button onClick={handleSendText} className="w-9 h-9 mb-0 bg-blue-500 hover:bg-blue-600 rounded-full flex items-center justify-center text-white active:scale-90 transition-transform flex-shrink-0 shadow-lg"><i className="fa-solid fa-paper-plane text-[10px]"></i></button>
+            ) : (
+              <button onClick={handleStartRecording} className="w-9 h-9 mb-0 text-zinc-500 flex items-center justify-center rounded-full active:scale-90 flex-shrink-0 hover:text-red-500 transition-colors"><i className="fa-solid fa-microphone text-lg"></i></button>
+            )}
+          </>
+        ) : (
+          <div className="flex-1 flex items-center justify-between h-9 animate-in fade-in duration-200">
+             <div className="flex items-center gap-3">
+               <div className="w-2.5 h-2.5 bg-red-500 rounded-full animate-pulse shadow-[0_0_10px_rgba(239,68,68,0.5)]"></div>
+               <span className="text-white font-mono text-sm tracking-widest">{formatTime(recordingTime)}</span>
+             </div>
+             <p className="text-[10px] text-zinc-500 uppercase tracking-widest font-black hidden md:block">Gravando...</p>
+             <div className="flex items-center gap-3">
+               <button onClick={handleCancelRecording} className="text-[10px] font-black uppercase text-zinc-500 hover:text-white transition-colors px-2">Cancelar</button>
+               <button onClick={handleStopAndSend} className="w-9 h-9 bg-blue-500 hover:bg-blue-600 rounded-full flex items-center justify-center text-white shadow-lg active:scale-90 transition-transform"><i className="fa-solid fa-paper-plane text-[10px]"></i></button>
+             </div>
+          </div>
+        )}
+      </div>
+      {showEmojis && !isRecording && <div ref={emojiPickerRef} className="absolute bottom-full left-2 mb-2 z-40 shadow-2xl rounded-2xl overflow-hidden border border-zinc-700"><EmojiPicker onEmojiClick={(d) => setInputText(p => p + d.emoji)} theme={Theme.DARK} width={280} height={320} previewConfig={{ showPreview: false }} /></div>}
+    </footer>
+  );
+});
+
+// --- Componente Principal ---
+
+const ChatInterface: React.FC<ChatInterfaceProps> = ({ 
+  messages, partner, onSendMessage, onMarkAsRead, onSendNudge, onNavigateToProfile, currentUserId, 
+  isPartnerTyping, onTyping, onEditMessage, onDeleteMessage, onReactMessage, 
+  onLoadMore, onLoadNext, hasMore, hasNewer, isLoadingMore, isLoadingNext, 
+  isViewingHistory, newLiveCount, onJumpToMessage, onReloadLatest 
+}) => {
+  const [previewImage, setPreviewImage] = useState<string | null>(null);
+  const [menuOpenId, setMenuOpenId] = useState<string | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [replyingTo, setReplyingTo] = useState<Message | null>(null);
+  const [showScrollBottom, setShowScrollBottom] = useState(false);
+  const [newMessagesCount, setNewMessagesCount] = useState(0);
+  const [now, setNow] = useState(Date.now());
+  const [isSearching, setIsSearching] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState<Message[]>([]);
+  const [isSearchingDb, setIsSearchingDb] = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
+  const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
+  const [showLoveAnimation, setShowLoveAnimation] = useState(false);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const isJumpingRef = useRef(false);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const sentinelRef = useRef<HTMLDivElement>(null);
+  const bottomSentinelRef = useRef<HTMLDivElement>(null);
+  const lastScrollHeightRef = useRef(0);
+  const isAtBottomRef = useRef(true);
+  const isInitialLoad = useRef(true);
+  const imageInputRef = useRef<HTMLInputElement>(null);
+  const lastAnalyzedMsgRef = useRef<string | null>(null);
+  
+  // NOVO: Ref para armazenar o ID do jump pendente
+  const pendingJumpId = useRef<string | null>(null);
+
+  useEffect(() => { const timer = setInterval(() => setNow(Date.now()), 30000); return () => clearInterval(timer); }, []);
+
+  const visibleMessages = useMemo(() => messages.filter(m => !m.is_deleted), [messages]);
+
+  useEffect(() => {
+    if (visibleMessages.length === 0) return;
+    const lastMsg = visibleMessages[visibleMessages.length - 1];
+    if (lastMsg.id !== lastAnalyzedMsgRef.current && lastMsg.type === 'text' && lastMsg.text) {
+      lastAnalyzedMsgRef.current = lastMsg.id;
+      const lovePattern = /(te\s+amo|amo\s+(voce|você|vc))/i;
+      if (lovePattern.test(lastMsg.text)) setShowLoveAnimation(true);
+    }
+  }, [visibleMessages]);
+
+  const handleScroll = () => {
+    if (!scrollRef.current) return;
+    const { scrollTop, scrollHeight, clientHeight } = scrollRef.current;
+    
+    if (!isLoadingMore && !isJumpingRef.current && hasMore && scrollTop < 100) {
+        lastScrollHeightRef.current = scrollHeight; 
+        onLoadMore();
+    }
+
+    const atBottom = scrollHeight - scrollTop - clientHeight < 150;
+    isAtBottomRef.current = atBottom;
+    if (atBottom) { setShowScrollBottom(false); if (!isViewingHistory) setNewMessagesCount(0); if (isViewingHistory && hasNewer && !isLoadingNext) onLoadNext(); }
+    else { setShowScrollBottom(true); }
+  };
+
+  useEffect(() => {
+    const observer = new IntersectionObserver(([entry]) => { if (entry.isIntersecting && hasMore && !isLoadingMore && !isJumpingRef.current) { lastScrollHeightRef.current = scrollRef.current?.scrollHeight || 0; onLoadMore(); } }, { threshold: 0.1 });
+    if (sentinelRef.current) observer.observe(sentinelRef.current);
+    const bottomObserver = new IntersectionObserver(([entry]) => { if (entry.isIntersecting && hasNewer && !isLoadingNext && !isJumpingRef.current) onLoadNext(); }, { threshold: 0.1 });
+    if (bottomSentinelRef.current) bottomObserver.observe(bottomSentinelRef.current);
+    return () => { observer.disconnect(); bottomObserver.disconnect(); };
+  }, [hasMore, hasNewer, isLoadingMore, isLoadingNext, onLoadMore, onLoadNext]);
+
+  const scrollToBottom = useCallback(async (behavior: ScrollBehavior = 'smooth') => {
+    if (isViewingHistory && onReloadLatest) {
+      setSearchQuery(''); setSearchResults([]); setHighlightedMessageId(null); await onReloadLatest();
+      setTimeout(() => { if (scrollRef.current) scrollRef.current.scrollTo({ top: 9999999, behavior }); }, 100);
+    } else if (scrollRef.current) { scrollRef.current.scrollTo({ top: 9999999, behavior }); }
+    setNewMessagesCount(0); setShowScrollBottom(false); isAtBottomRef.current = true;
+  }, [isViewingHistory, onReloadLatest]);
+
+  const scrollToMessage = useCallback((id: string) => {
+    if (!scrollRef.current) return;
+    const attemptScroll = () => {
+      const element = scrollRef.current?.querySelector(`[data-id="${id}"]`);
+      if (element) { element.scrollIntoView({ behavior: 'auto', block: 'center' }); setHighlightedMessageId(id); setTimeout(() => setHighlightedMessageId(null), 2500); if (navigator.vibrate) navigator.vibrate(20); return true; }
+      return false;
+    };
+    if (!attemptScroll()) setTimeout(attemptScroll, 100);
+  }, []);
+
+  // NOVO: Effect "Vigilante" para o Jump Search
+  useLayoutEffect(() => {
+    if (pendingJumpId.current && scrollRef.current) {
+        const targetId = pendingJumpId.current;
+        const element = scrollRef.current.querySelector(`[data-id="${targetId}"]`);
+        
+        if (element) {
+            // Elemento encontrado! Executar scroll.
+            element.scrollIntoView({ behavior: 'auto', block: 'center' });
+            
+            // Highlight visual
+            setHighlightedMessageId(targetId);
+            setTimeout(() => setHighlightedMessageId(null), 2500);
+            
+            if (navigator.vibrate) navigator.vibrate(20);
+            
+            // Limpa o pendente
+            pendingJumpId.current = null;
+            // Libera a trava de scroll com um pequeno delay
+            setTimeout(() => { isJumpingRef.current = false; }, 500);
+        }
+    }
+  }, [visibleMessages]); // Roda sempre que a lista de mensagens muda
+
+  useEffect(() => { 
+    if (isInitialLoad.current || isViewingHistory) return;
+    const lastMsg = visibleMessages[visibleMessages.length - 1];
+    if (lastMsg?.sender_id !== currentUserId) {
+        if (!isAtBottomRef.current) {
+            setNewMessagesCount(prev => prev + 1);
+            setShowScrollBottom(true);
+        }
+    }
+  }, [visibleMessages.length, isViewingHistory, currentUserId]);
+
+  useEffect(() => {
+    if (!scrollRef.current) return;
+    const resizeObserver = new ResizeObserver(() => {
+      if (isJumpingRef.current) return;
+      if (isInitialLoad.current) {
+        scrollToBottom('auto');
+        if (visibleMessages.length > 0) { setTimeout(() => { scrollToBottom('auto'); isInitialLoad.current = false; }, 50); }
+      }
+    });
+    resizeObserver.observe(scrollRef.current);
+    return () => resizeObserver.disconnect();
+  }, [visibleMessages.length, scrollToBottom]);
+
+  useLayoutEffect(() => {
+    if (isLoadingMore) return;
+    if (visibleMessages.length === 0) return;
+
+    if (scrollRef.current) {
+      if (lastScrollHeightRef.current > 0) {
+        const newScrollHeight = scrollRef.current.scrollHeight;
+        const diff = newScrollHeight - lastScrollHeightRef.current;
+        if (diff > 0) {
+            scrollRef.current.scrollTop = diff;
+        }
+        lastScrollHeightRef.current = 0;
+      } else if (!isInitialLoad.current) {
+        const lastMsg = visibleMessages[visibleMessages.length - 1];
+        if (lastMsg?.sender_id === currentUserId || isAtBottomRef.current) {
+            requestAnimationFrame(() => scrollToBottom('smooth'));
+        }
+      }
+    }
+  }, [visibleMessages.length, isLoadingMore, currentUserId, scrollToBottom]);
+
+  const renderStatus = (msg: Message) => {
+    if (msg.sender_id !== currentUserId) return null;
+    if (msg.is_pending) return <i className="fa-solid fa-clock text-[9px] text-white/30 animate-pulse"></i>;
+    if (msg.read_at) return <i className="fa-solid fa-check-double text-[9px] text-white"></i>;
+    if (msg.delivered_at) return <i className="fa-solid fa-check-double text-[9px] text-white/60"></i>;
+    return <i className="fa-solid fa-check text-[9px] text-white/30"></i>;
+  };
+
+  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    localStorage.removeItem('capy_is_selecting_file');
+    const file = e.target.files?.[0];
+    if (!file || !currentUserId) return;
+    try {
+      setIsUploading(true);
+      const fileExt = file.name.split('.').pop()?.toLowerCase();
+      const fileName = `${currentUserId}-${Date.now()}.${fileExt}`;
+      const filePath = `chat-media/${fileName}`;
+      let type: 'image' | 'video' | 'audio' | 'document' = 'document';
+      if (['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(fileExt || '')) type = 'image';
+      else if (['mp4', 'webm', 'mov', 'avi'].includes(fileExt || '')) type = 'video';
+      else if (['mp3', 'wav', 'ogg', 'm4a'].includes(fileExt || '')) type = 'audio';
+      const { error: uploadError } = await supabase.storage.from('CapyBook').upload(filePath, file);
+      if (uploadError) throw uploadError;
+      const { data } = supabase.storage.from('CapyBook').getPublicUrl(filePath);
+      if (data) { onSendMessage(data.publicUrl, type, replyingTo?.id); setReplyingTo(null); }
+    } catch (err) { alert("Erro ao carregar o arquivo."); } finally { setIsUploading(false); }
+  };
+
+  const handleSearch = async (query: string) => {
+    setSearchQuery(query);
+    if (!query.trim()) { setSearchResults([]); return; }
+    try {
+      setIsSearchingDb(true);
+      const { data, error } = await supabase.from('messages').select('*').ilike('text', `%${query}%`).order('created_at', { ascending: false }).limit(30);
+      if (error) throw error;
+      setSearchResults(data || []);
+    } catch (err) { } finally { setIsSearchingDb(false); }
+  };
+
+  // REVISADO: Lógica de clique no search
+  const handleSearchResultClick = async (msg: Message) => {
+    setIsSearching(false);
+    setSearchQuery('');
+    setSearchResults([]);
+    
+    isJumpingRef.current = true;
+    isAtBottomRef.current = false;
+    
+    const isAlreadyVisible = visibleMessages.some(m => m.id === msg.id);
+
+    if (isAlreadyVisible) {
+        // Se já está visível, scrolla direto (não precisa esperar o effect)
+        scrollToMessage(msg.id);
+        setTimeout(() => { isJumpingRef.current = false; }, 500);
+    } else {
+        // Se não está, define o ID pendente e chama o fetch
+        // O useLayoutEffect cuidará do scroll assim que a mensagem renderizar
+        pendingJumpId.current = msg.id;
+        if (onJumpToMessage) {
+            await onJumpToMessage(msg);
+        }
+    }
+  };
+
+  const statusLabel = useMemo(() => {
+    if (!partner.last_seen) return 'visto recentemente';
+    const last = new Date(partner.last_seen);
+    const today = new Date().toDateString() === last.toDateString();
+    const timeStr = last.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    return today ? `visto hoje às ${timeStr}` : `visto em ${last.toLocaleDateString('pt-BR')} às ${timeStr}`;
+  }, [partner.last_seen]);
+
+  const isOnline = partner.status === 'online';
+
+  return (
+    <div className="flex flex-col h-full bg-[#000000] relative overflow-hidden">
+      <style>{ELASTIC_STYLES}</style>
+      {showLoveAnimation && <LoveAnimation onComplete={() => setShowLoveAnimation(false)} />}
+      
+      <header className="flex-shrink-0 h-13 bg-black border-b border-zinc-900 flex items-center justify-between px-3 z-20">
+        <div className="flex items-center gap-3">
+          <img src={partner.avatar_url || `${STORAGE_URL}/lizzie.jpg`} className="w-9 h-9 rounded-full border border-zinc-800 object-cover shadow-sm" />
+          <div className="min-w-0">
+            <h2 className="font-display font-bold text-white text-sm truncate leading-tight">{partner.name}</h2>
+            <div className={`text-[7px] uppercase font-black tracking-widest transition-colors duration-500 flex items-center h-3.5 ${isPartnerTyping || isOnline ? 'text-blue-500' : 'text-zinc-500'}`}>
+              {isPartnerTyping ? <TypingIndicator /> : isOnline ? 'Online' : statusLabel}
+            </div>
+          </div>
+        </div>
+        <div className="flex gap-2">
+          {isUploading && <i className="fa-solid fa-spinner animate-spin text-blue-500 my-auto mr-2 text-[10px]"></i>}
+          <button onClick={() => setIsSearching(true)} className="w-8 h-8 rounded-full bg-zinc-900 text-blue-500 border border-zinc-800 active:scale-95 flex items-center justify-center"><i className="fa-solid fa-magnifying-glass text-[10px]"></i></button>
+          <button onClick={onSendNudge} className="w-8 h-8 rounded-full bg-zinc-900 text-blue-500 border border-zinc-800 active:scale-95 flex items-center justify-center"><i className="fa-solid fa-mobile-screen-button text-[10px]"></i></button>
+          <button onClick={onNavigateToProfile} className="w-8 h-8 rounded-full bg-zinc-900 text-blue-500 border border-zinc-800 active:scale-95 flex items-center justify-center"><i className="fa-solid fa-ellipsis-vertical text-[10px]"></i></button>
+        </div>
+      </header>
+
+      {isSearching && (
+        <div className="absolute inset-0 z-[60] bg-black/98 backdrop-blur-xl animate-in fade-in slide-in-from-top-4 duration-300 flex flex-col">
+          <div className="h-13 flex items-center gap-3 px-3 border-b border-zinc-900">
+            <button onClick={() => setIsSearching(false)} className="text-blue-500"><i className="fa-solid fa-arrow-left"></i></button>
+            <input ref={searchInputRef} autoFocus type="text" placeholder="Pesquisar mensagens..." className="flex-1 bg-transparent border-none text-white placeholder-zinc-700 focus:ring-0 outline-none focus:outline-none text-sm font-serif" value={searchQuery} onChange={(e) => handleSearch(e.target.value)} />
+            {isSearchingDb && <i className="fa-solid fa-circle-notch animate-spin text-blue-500 text-xs"></i>}
+          </div>
+          <div className="flex-1 overflow-y-auto p-3 space-y-2.5 custom-scrollbar">
+            {searchResults.length === 0 && searchQuery.length > 2 && !isSearchingDb && <p className="text-center text-zinc-700 text-xs font-serif italic mt-10">Nenhuma mensagem encontrada...</p>}
+            {searchResults.map(msg => (
+              <div key={msg.id} onClick={() => handleSearchResultClick(msg)} className="p-3 bg-zinc-900/50 rounded-lg border border-zinc-800 active:scale-95 transition-all cursor-pointer">
+                <div className="flex justify-between items-start mb-1"><span className="text-[10px] font-black text-blue-500 uppercase tracking-tighter">{msg.sender_id === currentUserId ? 'Você' : partner.name}</span><span className="text-[8px] text-zinc-600">{new Date(msg.created_at).toLocaleDateString('pt-BR')}</span></div>
+                <p className="text-[12px] text-zinc-300 font-serif line-clamp-2">{msg.type === 'text' ? renderMessageText(msg.text!, msg.sender_id === currentUserId, searchQuery) : `[Mídia]`}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div 
+        ref={scrollRef} 
+        onScroll={handleScroll} 
+        className="flex-1 overflow-y-auto p-2.5 space-y-2 scrollbar-hide relative"
+        style={{ overflowAnchor: 'none' }}
+      >
+        <div ref={sentinelRef} className="h-1" />
+        
+        {isLoadingMore && (
+           <div className="absolute top-2 left-0 right-0 flex justify-center z-10 pointer-events-none">
+              <div className="bg-black/60 rounded-full p-1 shadow-md backdrop-blur-sm">
+                <i className="fa-solid fa-circle-notch animate-spin text-blue-500 text-[10px]"></i>
+              </div>
+           </div>
+        )}
+
+        {isViewingHistory && !isLoadingMore && <div className="flex items-center justify-center py-1.5 animate-in fade-in duration-500"><span className="px-3 py-0.5 bg-blue-500/10 border border-blue-500/20 rounded-full text-[9px] text-blue-500 font-black uppercase tracking-widest shadow-sm">Histórico</span></div>}
+        
+        {visibleMessages.map((msg, i) => {
+          const prevMsg = i > 0 ? visibleMessages[i - 1] : null;
+          const showDivider = !prevMsg || new Date(prevMsg.created_at).toDateString() !== new Date(msg.created_at).toDateString();
+          
+          let animDelay = 0;
+          const isInitialAnimation = isInitialLoad.current; 
+          const totalMsgs = visibleMessages.length;
+          
+          if (isInitialAnimation) {
+              const startStaggerIndex = Math.max(0, totalMsgs - 15);
+              if (i >= startStaggerIndex) {
+                  animDelay = (i - startStaggerIndex) * 0.05;
+              }
+          } else {
+              animDelay = 0;
+          }
+
+          return (
+            <React.Fragment key={msg.id}>
+              {showDivider && <DateDivider date={msg.created_at} />}
+              <MessageItem
+                msg={msg} isMe={msg.sender_id === currentUserId} currentUserId={currentUserId} partner={partner} isMenuOpen={menuOpenId === msg.id} isEditing={editingId === msg.id} index={i}
+                onReactMessage={onReactMessage} onDeleteMessage={onDeleteMessage} onEditMessage={onEditMessage} onStartReply={setReplyingTo} onSetMenuOpen={setMenuOpenId} onSetEditing={setEditingId} onPreviewImage={setPreviewImage}
+                renderReplyContext={(id, me) => {
+                  const replyMsg = visibleMessages.find(m => m.id === id);
+                  if (!id || !replyMsg) return null;
+                  return <div onClick={(e) => { e.stopPropagation(); scrollToMessage(id); }} className={`mb-1.5 p-1.5 rounded-md border-l-2 bg-black/20 text-[11px] font-serif italic line-clamp-2 max-w-[190px] cursor-pointer border-white/40 text-white/80 active:scale-95 transform-gpu`}>{replyMsg.text || 'figurinha'}</div>;
+                }}
+                renderStatus={renderStatus} onMediaLoad={() => { if (isAtBottomRef.current || isInitialLoad.current) scrollToBottom(isInitialLoad.current ? 'auto' : 'smooth'); }} searchQuery={searchQuery} isHighlighted={highlightedMessageId === msg.id}
+                animDelay={animDelay}
+              />
+            </React.Fragment>
+          );
+        })}
+        {isLoadingNext && <div className="text-center py-1.5"><i className="fa-solid fa-circle-notch animate-spin text-blue-500 text-[10px]"></i></div>}
+        <div ref={bottomSentinelRef} className="h-1" />
+      </div>
+
+      {showScrollBottom && (
+        <button onClick={() => scrollToBottom('smooth')} className={`fixed ${replyingTo ? 'bottom-40' : 'bottom-24'} right-5 z-40 bg-zinc-800 text-white w-9 h-9 rounded-full shadow-2xl border border-zinc-700 flex items-center justify-center animate-bounce transition-all active:scale-90`}>
+          <div className="relative">{isViewingHistory ? <i className="fa-solid fa-angles-down text-xs"></i> : <i className="fa-solid fa-chevron-down text-xs"></i>}{(isViewingHistory ? (newLiveCount > 0) : (newMessagesCount > 0)) && <span className="absolute -top-1.5 -right-1.5 bg-blue-600 text-[8px] font-black w-4 h-4 rounded-full flex items-center justify-center border border-black animate-in zoom-in">{isViewingHistory ? (newLiveCount > 9 ? '+9' : newLiveCount) : (newMessagesCount > 9 ? '+9' : newMessagesCount)}</span>}</div>
+        </button>
+      )}
+
+      <input type="file" ref={imageInputRef} onChange={handleFileSelect} className="hidden" />
+      <ChatInputFooter 
+        onSendMessage={onSendMessage} 
+        onTyping={onTyping} 
+        replyingTo={replyingTo} 
+        onCancelReply={() => setReplyingTo(null)} 
+        partnerName={partner.name} 
+        currentUserId={currentUserId} 
+        onFileClick={() => {
+          localStorage.setItem('capy_is_selecting_file', 'true');
+          imageInputRef.current?.click();
+        }} 
+      />
+      {previewImage && <ImageModal url={previewImage} onClose={() => setPreviewImage(null)} />}
+    </div>
+  );
+};
+
+export default ChatInterface;
+
+// Preservação Total: Mantive a animação elástica e a correção do swipe/scroll das etapas anteriores
+</file>
+
+<file path=".\components\ImageModal.tsx">
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+
+interface ImageModalProps {
+  url: string;
+  onClose: () => void;
+}
+
+const ImageModal: React.FC<ImageModalProps> = ({ url, onClose }) => {
+  const [scale, setScale] = useState(1);
+  const [position, setPosition] = useState({ x: 0, y: 0 });
+  const [isDragging, setIsDragging] = useState(false);
+  
+  const imgRef = useRef<HTMLImageElement>(null);
+  const lastTouch = useRef({ x: 0, y: 0, distance: 0 });
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  const resetZoom = useCallback(() => {
+    setScale(1);
+    setPosition({ x: 0, y: 0 });
+  }, []);
+
+  const handleDownload = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      const response = await fetch(url);
+      const blob = await response.blob();
+      const blobUrl = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      link.download = `capy-love-${Date.now()}.jpg`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(blobUrl);
+    } catch (error) {
+      console.error('Download failed:', error);
+      // Fallback: open in new tab
+      window.open(url, '_blank');
+    }
+  };
+
+  const onTouchStart = (e: React.TouchEvent) => {
+    if (e.touches.length === 1) {
+      setIsDragging(true);
+      lastTouch.current = { x: e.touches[0].clientX, y: e.touches[0].clientY, distance: 0 };
+    } else if (e.touches.length === 2) {
+      setIsDragging(false);
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      lastTouch.current.distance = Math.sqrt(dx * dx + dy * dy);
+    }
+  };
+
+  const onTouchMove = (e: React.TouchEvent) => {
+    if (e.touches.length === 1 && isDragging && scale > 1) {
+      const dx = e.touches[0].clientX - lastTouch.current.x;
+      const dy = e.touches[0].clientY - lastTouch.current.y;
+      
+      setPosition(prev => ({
+        x: prev.x + dx,
+        y: prev.y + dy
+      }));
+      
+      lastTouch.current = { x: e.touches[0].clientX, y: e.touches[0].clientY, distance: 0 };
+    } else if (e.touches.length === 2) {
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      const distance = Math.sqrt(dx * dx + dy * dy);
+      
+      const delta = distance / lastTouch.current.distance;
+      const newScale = Math.min(Math.max(scale * delta, 1), 4);
+      
+      setScale(newScale);
+      lastTouch.current.distance = distance;
+      
+      if (newScale === 1) setPosition({ x: 0, y: 0 });
+    }
+  };
+
+  const onTouchEnd = () => {
+    setIsDragging(false);
+  };
+
+  // Prevent closing when clicking the image or buttons
+  const stopPropagation = (e: React.MouseEvent | React.TouchEvent) => {
+    e.stopPropagation();
+  };
+
+  return (
+    <div 
+      ref={containerRef}
+      className="fixed inset-0 z-[100] bg-black/95 flex flex-col animate-in fade-in duration-300"
+      onClick={onClose}
+      onTouchMove={(e) => e.preventDefault()}
+    >
+      {/* Header with Close and Download */}
+      <div className="flex justify-between items-center p-4 z-10 w-full relative">
+        <button 
+          onClick={onClose}
+          className="w-10 h-10 flex items-center justify-center bg-white/10 rounded-full text-white active:scale-95 transition-all"
+        >
+          <i className="fa-solid fa-xmark text-lg"></i>
+        </button>
+        
+        <div className="flex gap-2">
+            <button 
+              onClick={handleDownload}
+              className="w-10 h-10 flex items-center justify-center bg-amber-500 rounded-full text-amber-950 active:scale-95 transition-all shadow-lg"
+              title="Download"
+            >
+              <i className="fa-solid fa-download"></i>
+            </button>
+            <button 
+              onClick={(e) => { e.stopPropagation(); resetZoom(); }}
+              className={`w-10 h-10 flex items-center justify-center bg-white/10 rounded-full text-white active:scale-95 transition-all ${scale === 1 ? 'opacity-0 pointer-events-none' : 'opacity-100'}`}
+              title="Reset Zoom"
+            >
+              <i className="fa-solid fa-maximize"></i>
+            </button>
+        </div>
+      </div>
+
+      <div className="flex-1 relative overflow-hidden flex items-center justify-center select-none"
+        onTouchStart={onTouchStart}
+        onTouchMove={onTouchMove}
+        onTouchEnd={onTouchEnd}
+      >
+        <img
+          ref={imgRef}
+          src={url}
+          alt="Preview"
+          className="max-w-full max-h-full transition-transform duration-75 ease-out rounded-sm shadow-2xl"
+          style={{ 
+            transform: `translate(${position.x}px, ${position.y}px) scale(${scale})`,
+            touchAction: 'none'
+          }}
+          onClick={stopPropagation}
+          draggable={false}
+        />
+      </div>
+
+      <div className="p-6 text-center text-white/40 text-[10px] uppercase tracking-widest font-black pointer-events-none">
+        {scale > 1 ? 'Arraste para navegar • Use dois dedos para zoom' : 'Pince para dar zoom • Toque fora para fechar'}
+      </div>
+    </div>
+  );
+};
+
+export default ImageModal;
+
+</file>
+
+<file path=".\components\Library.tsx">
+
+import React from 'react';
+
+const BOOKS = [
+  { id: 1, title: "Nosso Primeiro Dia", author: "Lembrança", color: "bg-red-900" },
+  { id: 2, title: "Momentos Felizes", author: "Lembrança", color: "bg-slate-800" },
+  { id: 3, title: "Coisas que Amo em Você", author: "Lembrança", color: "bg-amber-800" },
+  { id: 4, title: "Nossa História: Vol 1", author: "Nós", color: "bg-blue-900" },
+  { id: 5, title: "Pequenos Gestos", author: "Carinho", color: "bg-pink-700" },
+  { id: 6, title: "Sonhos Compartilhados", author: "Futuro", color: "bg-purple-900" },
+];
+
+const Library: React.FC = () => {
+  return (
+    <div className="flex-1 p-6 overflow-y-auto bg-[#081421] relative">
+      <div className="max-w-4xl mx-auto">
+        <header className="mb-10 text-center">
+          <div className="inline-block p-4 rounded-full bg-blue-900/20 border border-blue-500/20 mb-4">
+            <i className="fa-solid fa-images text-3xl text-blue-500"></i>
+          </div>
+          <h2 className="text-4xl font-display italic text-blue-100 mb-2">Nossas Lembranças</h2>
+          <p className="text-blue-500/60 font-serif text-sm tracking-widest uppercase">Um cantinho para guardar o que importa</p>
+        </header>
+
+        <div className="space-y-12 pb-20">
+            <div className="relative pt-10 px-8 bg-[#0f172a] border-x-[12px] border-[#081421] shadow-2xl rounded-sm">
+                <div className="flex items-end justify-center gap-1 md:gap-4 flex-wrap pb-1">
+                    {BOOKS.slice(0, 3).map((book) => (
+                         <div key={book.id} className={`
+                            group relative w-20 md:w-28 h-56 md:h-72 ${book.color} 
+                            rounded-l-sm rounded-r-md shadow-2xl 
+                            border-l border-white/10 hover:-translate-y-4 transition-transform duration-300 cursor-pointer
+                            flex flex-col items-center justify-center p-2 text-center
+                         `}>
+                            <div className="absolute top-4 w-full h-[2px] bg-yellow-500/30"></div>
+                            <span className="text-amber-100/90 font-serif text-xs md:text-sm font-bold writing-vertical-rl rotate-180 line-clamp-3">
+                                {book.title}
+                            </span>
+                         </div>
+                    ))}
+                     <img 
+                        src="https://media.tenor.com/J1yB9XW50J0AAAAi/capybara-eating.gif" 
+                        className="w-20 h-20 object-contain mb-1 drop-shadow-xl"
+                    />
+                </div>
+                <div className="h-6 w-full bg-[#1e293b] shadow-2xl border-t border-blue-900/40 relative z-10"></div>
+            </div>
+        </div>
+
+        <div className="text-center">
+            <p className="text-blue-500/40 text-xs font-mono">Em breve: Guarde fotos reais aqui.</p>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default Library;
+
+</file>
+
+<file path=".\components\LoveAnimation.tsx">
+import React, { useEffect, useState, useMemo } from 'react';
+
+interface LoveAnimationProps {
+  onComplete: () => void;
+}
+
+const LoveAnimation: React.FC<LoveAnimationProps> = ({ onComplete }) => {
+  const [visible, setVisible] = useState(true);
+
+  const hearts = useMemo(() => {
+    return Array.from({ length: 25 }).map((_, i) => ({
+      id: i,
+      left: `${Math.random() * 100}%`,
+      delay: `${Math.random() * 2}s`,
+      size: `${15 + Math.random() * 30}px`,
+      duration: `${3 + Math.random() * 2}s`,
+      emoji: ['❤️', '💖', '💘', '💕', '✨'][Math.floor(Math.random() * 5)]
+    }));
+  }, []);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setVisible(false);
+      onComplete();
+    }, 5000);
+    return () => clearTimeout(timer);
+  }, [onComplete]);
+
+  if (!visible) return null;
+
+  return (
+    <div className="fixed inset-0 pointer-events-none z-[5] overflow-hidden">
+      {hearts.map((heart) => (
+        <span
+          key={heart.id}
+          className="absolute bottom-[-10%] animate-love-heart flex items-center justify-center opacity-0"
+          style={{
+            left: heart.left,
+            animationDelay: heart.delay,
+            animationDuration: heart.duration,
+            fontSize: heart.size,
+            filter: 'drop-shadow(0 0 5px rgba(255, 0, 0, 0.3))'
+          }}
+        >
+          {heart.emoji}
+        </span>
+      ))}
+      
+      {/* Overlay leve avermelhado nos cantos */}
+      <div className="absolute inset-0 bg-gradient-to-t from-red-500/5 to-transparent opacity-50"></div>
+    </div>
+  );
+};
+
+export default LoveAnimation;
+
+</file>
+
+<file path=".\components\ParticleBurst.tsx">
+import React, { useEffect, useState } from 'react';
+
+interface ParticleBurstProps {
+  x: number;
+  y: number;
+  emoji: string;
+  onComplete: () => void;
+}
+
+const ParticleBurst: React.FC<ParticleBurstProps> = ({ x, y, emoji, onComplete }) => {
+  const [active, setActive] = useState(true);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setActive(false);
+      onComplete();
+    }, 800);
+    return () => clearTimeout(timer);
+  }, [onComplete]);
+
+  if (!active) return null;
+
+  const particles = Array.from({ length: 8 }).map((_, i) => {
+    // Generate random directions for each particle
+    const angle = (i / 8) * 360 + (Math.random() * 20 - 10);
+    const distance = 60 + Math.random() * 60;
+    const dx = Math.cos(angle * Math.PI / 180) * distance;
+    const dy = Math.sin(angle * Math.PI / 180) * distance;
+    
+    return (
+      <span
+        key={i}
+        className="absolute pointer-events-none text-xl animate-particle"
+        style={{
+          left: x,
+          top: y,
+          '--dx': `${dx}px`,
+          '--dy': `${dy}px`,
+        } as any}
+      >
+        {emoji}
+      </span>
+    );
+  });
+
+  return <div className="fixed inset-0 z-[9999] pointer-events-none">{particles}</div>;
+};
+
+export default ParticleBurst;
+</file>
+
+<file path=".\components\PatternLock.tsx">
+
+// Arquivo removido - Substituído pelo sistema de PIN de 4 dígitos para melhor UX mobile.
+
+</file>
+
+<file path=".\components\Profile.tsx">
+import React, { useState, useRef } from 'react';
+import { UserProfile } from '../types';
+import { supabase } from '../services/supabase';
+import { getLatestAvatarUrl } from '../services/avatarService';
+
+interface ProfileProps {
+  initialProfile: UserProfile;
+  onUpdate: (updatedProfile: UserProfile) => void;
+  onBack: () => void;
+}
+
+const Profile: React.FC<ProfileProps> = ({ initialProfile, onUpdate, onBack }) => {
+  // Lógica de Estado (Mantida intacta conforme restrição)
+  const [name, setName] = useState(initialProfile.name);
+  const [bio, setBio] = useState(initialProfile.bio);
+  const [avatarUrl, setAvatarUrl] = useState(initialProfile.avatar_url);
+  const [pin, setPin] = useState(initialProfile.pin || '');
+  const [loading, setLoading] = useState(false);
+  const [message, setMessage] = useState('');
+  const [isError, setIsError] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    localStorage.removeItem('capy_is_selecting_file');
+    try {
+      if (!event.target.files || event.target.files.length === 0) return;
+      setLoading(true);
+      setMessage('Processando imagem...');
+      setIsError(false);
+      const file = event.target.files[0];
+      const fileExt = file.name.split('.').pop();
+      const fileName = `${initialProfile.id}-${Date.now()}.${fileExt}`;
+      const filePath = `avatars/${fileName}`;
+      const { error: uploadError } = await supabase.storage.from('CapyBook').upload(filePath, file, { upsert: true });
+      if (uploadError) throw uploadError;
+      const latestUrl = await getLatestAvatarUrl(initialProfile.id);
+      if (latestUrl) {
+        setAvatarUrl(latestUrl);
+        setMessage('Imagem pronta. Salve para aplicar.');
+      }
+    } catch (err: any) {
+      console.error("Erro no upload:", err);
+      setIsError(true);
+      setMessage('Falha no upload da imagem.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleTriggerFileSelection = () => {
+    localStorage.setItem('capy_is_selecting_file', 'true');
+    fileInputRef.current?.click();
+  };
+
+  const handleSave = async () => {
+    setLoading(true);
+    setMessage('');
+    setIsError(false);
+    try {
+      const { error } = await supabase.from('profiles').upsert({
+        id: initialProfile.id,
+        display_name: name,
+        bio: bio,
+        avatar_url: avatarUrl,
+        pin: pin
+      }, { onConflict: 'id' });
+      
+      if (error) throw error;
+      
+      const updatedUser = { ...initialProfile, name, bio, avatar_url: avatarUrl, pin };
+      onUpdate(updatedUser);
+      setMessage('Perfil atualizado.');
+      if (navigator.vibrate) navigator.vibrate(50);
+      setTimeout(() => setMessage(''), 3000);
+    } catch (err: any) {
+      setIsError(true);
+      setMessage('Erro ao persistir dados.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col h-full bg-zinc-950 text-zinc-100 overflow-hidden relative font-sans">
+      
+      {/* Header Sticky com Glassmorphism */}
+      <div className="absolute top-0 left-0 right-0 z-20 flex items-center justify-between px-6 py-4 bg-zinc-950/80 backdrop-blur-md border-b border-white/5">
+        <button 
+          onClick={onBack} 
+          className="p-2 -ml-2 text-zinc-400 hover:text-white transition-colors active:scale-90"
+        >
+          <i className="fa-solid fa-arrow-left text-lg"></i>
+        </button>
+        <span className="text-sm font-bold uppercase tracking-widest text-zinc-500">Configurações</span>
+        <div className="w-8" /> {/* Spacer para balancear o layout */}
+      </div>
+
+      {/* Conteúdo Scrollável */}
+      <div className="flex-1 overflow-y-auto pt-24 pb-32 px-6 scrollbar-hide">
+        <div className="max-w-md mx-auto space-y-8 animate-in slide-in-from-bottom-4 duration-500 fade-in">
+          
+          {/* Seção Avatar */}
+          <div className="flex flex-col items-center">
+            <div className="relative group">
+              <div className="w-32 h-32 rounded-full ring-4 ring-zinc-900 ring-offset-2 ring-offset-zinc-800 overflow-hidden shadow-2xl bg-zinc-900">
+                <img 
+                  src={avatarUrl || 'https://via.placeholder.com/200'} 
+                  className="w-full h-full object-cover transition-opacity duration-300 group-hover:opacity-75" 
+                  alt="Avatar"
+                />
+              </div>
+              <button 
+                onClick={handleTriggerFileSelection}
+                className="absolute bottom-0 right-0 w-10 h-10 bg-blue-600 rounded-full flex items-center justify-center text-white shadow-lg border-4 border-zinc-950 active:scale-90 transition-transform"
+              >
+                <i className="fa-solid fa-camera text-xs"></i>
+              </button>
+              <input type="file" ref={fileInputRef} onChange={handleFileUpload} accept="image/*" className="hidden" />
+            </div>
+            
+            {/* Input URL Discreto */}
+            <div className="mt-6 w-full">
+              <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest mb-2 block text-center">Ou cole uma URL</label>
+              <input 
+                type="text" 
+                value={avatarUrl} 
+                onChange={(e) => setAvatarUrl(e.target.value)} 
+                className="w-full bg-zinc-900/50 border border-white/5 rounded-lg px-3 py-2 text-xs text-zinc-400 text-center focus:outline-none focus:border-blue-500/50 transition-colors font-mono truncate"
+                placeholder="https://..."
+              />
+            </div>
+          </div>
+
+          <hr className="border-white/5" />
+
+          {/* Dados Públicos */}
+          <div className="space-y-5">
+            <h3 className="text-xs font-bold text-zinc-500 uppercase tracking-widest pl-1">Informações Públicas</h3>
+            
+            <div className="space-y-4">
+              <div className="group bg-zinc-900/40 border border-white/5 rounded-2xl p-1 focus-within:ring-1 focus-within:ring-blue-500/50 focus-within:border-blue-500/50 transition-all">
+                <label className="block text-[10px] text-zinc-500 uppercase tracking-wider px-4 pt-3">Nome de Exibição</label>
+                <input 
+                  type="text" 
+                  value={name} 
+                  onChange={(e) => setName(e.target.value)} 
+                  className="w-full bg-transparent p-4 pt-1 text-lg font-medium text-white placeholder-zinc-700 focus:outline-none"
+                  placeholder="Seu nome" 
+                />
+              </div>
+
+              <div className="group bg-zinc-900/40 border border-white/5 rounded-2xl p-1 focus-within:ring-1 focus-within:ring-blue-500/50 focus-within:border-blue-500/50 transition-all">
+                <label className="block text-[10px] text-zinc-500 uppercase tracking-wider px-4 pt-3">Biografia</label>
+                <textarea 
+                  value={bio} 
+                  onChange={(e) => setBio(e.target.value)} 
+                  rows={3} 
+                  className="w-full bg-transparent p-4 pt-1 text-sm text-zinc-300 placeholder-zinc-700 focus:outline-none resize-none leading-relaxed" 
+                  placeholder="Escreva algo breve..." 
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* Segurança */}
+          <div className="space-y-5">
+            <h3 className="text-xs font-bold text-zinc-500 uppercase tracking-widest pl-1 flex items-center gap-2">
+              <i className="fa-solid fa-lock text-[10px]"></i> Segurança
+            </h3>
+            
+            <div className="bg-zinc-900/40 border border-white/5 rounded-2xl p-5 flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium text-white">PIN de Acesso</p>
+                <p className="text-[10px] text-zinc-500 mt-1">Usado para destravar na calculadora.</p>
+              </div>
+              <input 
+                type="password" 
+                maxLength={4} 
+                inputMode="numeric" 
+                value={pin} 
+                onChange={(e) => setPin(e.target.value.replace(/\D/g, ''))} 
+                className="w-20 bg-black border border-zinc-800 rounded-lg py-2 text-center text-xl tracking-widest text-blue-500 font-bold focus:outline-none focus:border-blue-500 transition-colors" 
+                placeholder="0000" 
+              />
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      {/* Footer de Ação (Floating) */}
+      <div className="absolute bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-zinc-950 via-zinc-950 to-transparent z-20">
+        {message && (
+          <div className={`mb-4 px-4 py-2 rounded-full text-center text-xs font-bold uppercase tracking-wide animate-in slide-in-from-bottom-2 fade-in duration-300 ${isError ? 'bg-red-500/10 text-red-400 border border-red-500/20' : 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'}`}>
+            {message}
+          </div>
+        )}
+        
+        <button 
+          onClick={handleSave} 
+          disabled={loading} 
+          className="w-full h-14 bg-white text-black hover:bg-zinc-200 disabled:opacity-50 disabled:cursor-not-allowed font-bold text-sm uppercase tracking-widest rounded-xl shadow-xl active:scale-[0.98] transition-all flex items-center justify-center gap-3"
+        >
+          {loading ? (
+            <i className="fa-solid fa-circle-notch animate-spin text-zinc-500"></i>
+          ) : (
+            <i className="fa-solid fa-check"></i>
+          )}
+          <span>Salvar Alterações</span>
+        </button>
+      </div>
+    </div>
+  );
+};
+
+export default Profile;
+</file>
+
+<file path=".\components\Sidebar.tsx">
+
+import React from 'react';
+import { UserProfile } from '../types';
+
+interface SidebarProps {
+  partner: UserProfile;
+  currentUser: UserProfile;
+  activeView: string;
+  onNavigate: (view: string) => void;
+  onLogout: () => void;
+}
+
+const Sidebar: React.FC<SidebarProps> = ({ partner, currentUser, activeView, onNavigate, onLogout }) => {
+  return (
+    <div className="flex flex-col h-full bg-[#0f172a] w-full overflow-hidden border-r border-blue-900/30 relative">
+      <div className="absolute inset-0 bg-[url('https://www.transparenttextures.com/patterns/wood-pattern.png')] opacity-10 pointer-events-none"></div>
+
+      <div className="p-6 md:p-8 overflow-y-auto scrollbar-hide flex-1 relative z-10">
+        <h1 className="text-2xl font-display font-bold text-sky-500 mb-8 flex items-center gap-2 italic">
+          <i className="fa-solid fa-heart text-sky-600"></i> CapyBook
+        </h1>
+
+        <div className="p-4 rounded-xl bg-[#1e293b]/40 border border-sky-500/10 mb-8">
+          <div className="flex items-center gap-3">
+            <img
+              src={currentUser.avatar_url || 'https://picsum.photos/seed/love/200'}
+              className="w-12 h-12 rounded-full border border-sky-500/30 object-cover"
+              onError={(e) => { (e.target as HTMLImageElement).src = 'https://picsum.photos/seed/love/200'; }}
+            />
+            <div className="min-w-0">
+              <h3 className="font-serif font-bold text-base text-slate-50 truncate">{currentUser.name}</h3>
+              <p className="text-[8px] text-sky-500/60 uppercase font-black tracking-widest">Meu Cantinho</p>
+            </div>
+          </div>
+        </div>
+
+        <nav className="space-y-6">
+          <div className="space-y-2">
+            <button
+              onClick={() => onNavigate('chat')}
+              className={`w-full flex items-center gap-4 px-4 py-3 rounded-xl transition-all ${activeView === 'chat' ? 'bg-sky-500/10 text-sky-50' : 'text-slate-100/40 hover:text-slate-100'}`}
+            >
+              <i className={`fa-solid fa-comments w-5 text-center ${activeView === 'chat' ? 'text-sky-500' : 'text-blue-900'}`}></i>
+              <span className="font-serif text-lg italic">Conversar</span>
+            </button>
+            <button
+              onClick={() => onNavigate('library')}
+              className={`w-full flex items-center gap-4 px-4 py-3 rounded-xl transition-all ${activeView === 'library' ? 'bg-sky-500/10 text-sky-50' : 'text-slate-100/40 hover:text-slate-100'}`}
+            >
+              <i className={`fa-solid fa-images w-5 text-center ${activeView === 'library' ? 'text-sky-500' : 'text-blue-900'}`}></i>
+              <span className="font-serif text-lg italic">Memórias</span>
+            </button>
+          </div>
+        </nav>
+      </div>
+
+      <div
+        className="p-4 border-t border-blue-900/30 bg-[#0f172a] flex items-center justify-between text-sky-500/40"
+        style={{ paddingBottom: 'calc(env(safe-area-inset-bottom) + 1rem)' }}
+      >
+        <button onClick={() => onNavigate('profile')} className={`p-2 transition-colors ${activeView === 'profile' ? 'text-slate-100' : 'hover:text-slate-200'}`}>
+          <i className="fa-solid fa-gear"></i>
+        </button>
+        <button onClick={onLogout} className="p-2 hover:text-red-400 transition-colors"><i className="fa-solid fa-right-from-bracket"></i></button>
+      </div>
+    </div>
+  );
+};
+
+export default Sidebar;
+
+</file>
+
+<file path=".\services\avatarService.ts">
+import { supabase } from './supabase';
+
+// Cache em memória para evitar requisições repetitivas ao Supabase Storage
+const avatarCache = new Map<string, { url: string; timestamp: number }>();
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutos em milissegundos
+
+/**
+ * Busca a URL do avatar mais recente de um usuário.
+ * Implementa cache para reduzir a latência e o consumo de API em re-renders frequentes.
+ */
+export const getLatestAvatarUrl = async (userId: string): Promise<string | null> => {
+  // 1. Verificar se existe no cache e se ainda é válido (menos de 5 minutos)
+  const cachedEntry = avatarCache.get(userId);
+  const now = Date.now();
+  
+  if (cachedEntry && (now - cachedEntry.timestamp < CACHE_TTL)) {
+    return cachedEntry.url;
+  }
+
+  try {
+    // 2. Listar arquivos na pasta de avatars
+    const { data, error } = await supabase.storage
+      .from('CapyBook')
+      .list('avatars', {
+        limit: 100,
+        offset: 0
+      });
+
+    if (error || !data || data.length === 0) {
+      return null;
+    }
+
+    // 3. Filtrar arquivos pelo ID do usuário e ordenar pelo mais recente
+    const userFiles = data
+      .filter(file => file.name.includes(userId))
+      .sort((a, b) => {
+        const dateA = new Date(a.created_at || 0).getTime();
+        const dateB = new Date(b.created_at || 0).getTime();
+        return dateB - dateA;
+      });
+
+    if (userFiles.length === 0) {
+      return null;
+    }
+
+    // 4. Gerar a URL pública do arquivo mais recente encontrado
+    const latestFile = userFiles[0];
+    const { data: publicUrlData } = supabase.storage
+      .from('CapyBook')
+      .getPublicUrl(`avatars/${latestFile.name}`);
+
+    if (!publicUrlData || !publicUrlData.publicUrl) {
+      return null;
+    }
+
+    const finalUrl = publicUrlData.publicUrl;
+
+    // 5. Atualizar o cache antes de retornar
+    avatarCache.set(userId, {
+      url: finalUrl,
+      timestamp: now
+    });
+
+    return finalUrl;
+  } catch (err) {
+    // Falha silenciosa em caso de erro inesperado
+    return null;
+  }
+};
+
+</file>
+
+<file path=".\services\supabase.ts">
+
+import { createClient } from '@supabase/supabase-js';
+
+// Credenciais atualizadas do seu novo projeto
+const supabaseUrl = 'https://yggpwbvhyieaqvwwjcot.supabase.co'; 
+const supabaseAnonKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlnZ3B3YnZoeWllYXF2d3dqY290Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjgwODE4MjksImV4cCI6MjA4MzY1NzgyOX0.UK00JUukbjaLkLob3cW1XWaQBJ9cZd5-TuJZ384Q3Rc';
+
+export const isSupabaseConfigured = true;
+
+export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+    auth: {
+        persistSession: true,
+        autoRefreshToken: true,
+        detectSessionInUrl: false
+    },
+    realtime: {
+        params: {
+            eventsPerSecond: 10,
+        },
+    },
+    // Configurações globais de fetch para evitar alguns erros de rede intermitentes
+    global: {
+        headers: { 'x-application-name': 'capybook-love' }
+    }
+});
+
+</file>
+
+<file path=".\supabase\functions\push-notification\index.ts">
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+
+declare const Deno: any;
+
+const ONE_SIGNAL_APP_ID = "d4a8a2a3-3cca-4359-b644-3564cd377d76";
+const ONE_SIGNAL_REST_API_KEY = Deno.env.get('ONESIGNAL_REST_API_KEY') ?? "";
+
+serve(async (req) => {
+  const { record } = await req.json();
+  
+  // Apenas mensagens novas de outros usuários
+  if (!record || !record.text) {
+    return new Response("No record", { status: 400 });
+  }
+
+  // Identificar quem enviou e quem deve receber
+  const senderId = record.sender_id;
+  // Lógica simples: Se fui eu (Autor), manda pra Musa. Se foi Musa, manda pra Autor.
+  // Como só tem 2 usuários, hardcode ok.
+  const AUTOR_ID = '3711e2ca-338f-4df5-9cd9-1528f3a4242e';
+  const MUSA_ID = 'd7ff225d-4c5e-416d-964e-37eab9043297';
+  
+  const receiverId = senderId === AUTOR_ID ? MUSA_ID : AUTOR_ID;
+  const senderName = senderId === AUTOR_ID ? 'Amor' : 'Princesa';
+
+  // Preparar notificação
+  const notification = {
+    app_id: ONE_SIGNAL_APP_ID,
+    contents: { en: record.type === 'text' ? record.text : 'Enviou uma mídia 📷' },
+    headings: { en: `Mensagem de ${senderName}` },
+    include_external_user_ids: [receiverId], // Envia apenas para o destinatário específico
+    channel_for_external_user_ids: "push",
+    // Configurações Android
+    android_group: "capy_messages",
+    android_group_message: { en: "$[notif_count] novas mensagens" },
+  };
+
+  // Enviar para OneSignal
+  const res = await fetch("https://onesignal.com/api/v1/notifications", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+        "Authorization": `Basic ${ONE_SIGNAL_REST_API_KEY}`
+      },
+      body: JSON.stringify(notification)
+  });
+
+  const data = await res.json();
+  return new Response(JSON.stringify(data), { headers: { "Content-Type": "application/json" } });
+})
+</file>
+
